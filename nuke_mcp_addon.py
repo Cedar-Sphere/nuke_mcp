@@ -457,43 +457,7 @@ class NukeMCPServer:
         
         except Exception as e:
             raise Exception(f"Viewer playback error: {str(e)}")
-            
-    def safe_clear_dag(command_server):
-        """Send a safe DAG clearing command to Nuke"""
-        # This code explicitly excludes essential system nodes
-        code = """
-    # Define system nodes that should never be deleted
-    protected_classes = ['Root', 'Viewer', 'StickyNote', 'BackdropNode']
-
-    # Get list of non-system nodes that can be safely deleted
-    nodes_to_delete = []
-    for node in nuke.allNodes():
-        if node.Class() not in protected_classes:
-            nodes_to_delete.append(node)
-
-    # Delete nodes one by one with error protection
-    deleted_count = 0
-    for node in nodes_to_delete:
-        try:
-            node_name = node.name()
-            node_class = node.Class()
-            nuke.delete(node)
-            deleted_count += 1
-            print(f"Deleted {node_name} ({node_class})")
-        except Exception as e:
-            print(f"Failed to delete {node.name()}: {str(e)}")
-
-    # Report results
-    if deleted_count > 0:
-        print(f"Successfully deleted {deleted_count} nodes")
-    else:
-        print("No nodes were deleted")
-    """
-        
-        # Send the code to execute
-        return command_server.send_command("execute_code", {"code": code})
- 
- 
+    
     def execute_code(self, code=""):
         """Execute Python code in Nuke"""
         try:
