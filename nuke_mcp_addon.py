@@ -179,6 +179,30 @@ class NukeMCPServer:
             print(f"Error executing command: {str(e)}")
             traceback.print_exc()
             return {"status": "error", "message": str(e)}
+            
+    def _validate_node_name(self, name):
+        """
+        Validate a node name to prevent problematic naming patterns.
+        Returns a safe version of the name.
+        """
+        if not name:
+            return None
+        
+        # Check if name starts with a number
+        if name[0].isdigit():
+            print(f"Warning: Node name '{name}' starts with a number, which can cause issues")
+            # Prefix with a safe character (n_)
+            name = f"n_{name}"
+        
+        # Replace any invalid characters
+        # Nuke node names should only contain alphanumeric and underscore
+        import re
+        safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+        
+        if safe_name != name:
+            print(f"Warning: Node name '{name}' contained invalid characters, using '{safe_name}' instead")
+        
+        return safe_name
     
     def get_script_info(self):
         """Get information about the current Nuke script"""
@@ -210,7 +234,7 @@ class NukeMCPServer:
             return {"error": str(e)}
     
     def create_node(self, node_type, name=None, position=None, inputs=None, parameters=None):
-        """Create a new node in Nuke with improved error handling"""
+        """Create a new node in Nuke with improved error handling and name validation"""
         try:
             # Default parameters
             if position is None:
@@ -239,17 +263,32 @@ class NukeMCPServer:
                 
             print(f"Node created successfully: {node.name()}")
             
+            # *** CHANGE 1: Validate name before setting it ***
             # Set name if provided
             if name:
                 try:
-                    existing = nuke.toNode(name)
-                    if existing:
-                        suffix = 1
-                        while nuke.toNode(f"{name}_{suffix}"):
-                            suffix += 1
-                        name = f"{name}_{suffix}"
-                    node.setName(name)
-                    print(f"Set node name to: {name}")
+                    # Validate the name
+                    safe_name = self._validate_node_name(name)
+                    
+                    # Only try to set name if it's valid
+                    if safe_name:
+                        existing = nuke.toNode(safe_name)
+                        if existing:
+                            suffix = 1
+                            while nuke.toNode(f"{safe_name}_{suffix}"):
+                                suffix += 1
+                            safe_name = f"{safe_name}_{suffix}"
+                        
+                        node.setName(safe_name)
+                        print(f"Set node name to: {safe_name}")
+                        
+                        # *** CHANGE 2: If name was modified, add original as label ***
+                        if safe_name != name and "label" not in parameters:
+                            try:
+                                node["label"].setValue(name)
+                                print(f"Set node label to original name: {name}")
+                            except:
+                                pass
                 except Exception as e:
                     print(f"Warning: Could not set node name to {name}: {str(e)}")
             
