@@ -5,6 +5,7 @@ import threading
 import socket
 import time
 import traceback
+import os
 from typing import Dict, Any, List, Optional, Union
 
 class NukeMCPServer:
@@ -15,6 +16,9 @@ class NukeMCPServer:
         self.socket = None
         self.client = None
         self.buffer = b''  # Buffer for incomplete data
+        
+        # Cache for valid node types
+        self._valid_node_types = None
     
     def start(self):
         """Start the socket server"""
@@ -75,16 +79,26 @@ class NukeMCPServer:
                                 self.buffer += data
                                 # Try to process complete messages
                                 try:
-                                    # Attempt to parse the buffer as JSON
-                                    command = json.loads(self.buffer.decode('utf-8'))
-                                    # If successful, clear the buffer and process command
+                                    # Improved JSON check - count braces to verify completeness
+                                    buffer_str = self.buffer.decode('utf-8', errors='replace')
+                                    
+                                    # Simple check for JSON completeness
+                                    if buffer_str.count('{') == buffer_str.count('}') and buffer_str.strip().startswith('{'):
+                                        try:
+                                            # Attempt to parse the buffer as JSON
+                                            command = json.loads(buffer_str)
+                                            # If successful, clear the buffer and process command
+                                            self.buffer = b''
+                                            response = self.execute_command(command)
+                                            response_json = json.dumps(response)
+                                            self.client.sendall(response_json.encode('utf-8'))
+                                        except json.JSONDecodeError:
+                                            # Incomplete JSON, continue receiving
+                                            pass
+                                except Exception as e:
+                                    print(f"Error processing message: {str(e)}")
+                                    # Clear buffer on error to avoid getting stuck
                                     self.buffer = b''
-                                    response = self.execute_command(command)
-                                    response_json = json.dumps(response)
-                                    self.client.sendall(response_json.encode('utf-8'))
-                                except json.JSONDecodeError:
-                                    # Incomplete data, keep in buffer
-                                    pass
                             else:
                                 # Connection closed by client
                                 print("Client disconnected")
@@ -139,13 +153,18 @@ class NukeMCPServer:
             if handler:
                 try:
                     print(f"Executing handler for {cmd_type}")
+                    
+                    # Track execution time for debugging
+                    start_time = time.time()
+                    
                     result = handler(**params)
-                    print(f"Handler execution complete")
+                    
+                    # Log execution time
+                    end_time = time.time()
+                    execution_time = end_time - start_time
+                    print(f"Handler execution complete in {execution_time:.2f} seconds")
+                    
                     return {"status": "success", "result": result}
-                except Exception as e:
-                    print(f"Error in handler: {str(e)}")
-                    traceback.print_exc()
-                    return {"status": "error", "message": str(e)}
                 except Exception as e:
                     print(f"Error in handler: {str(e)}")
                     traceback.print_exc()
@@ -156,6 +175,129 @@ class NukeMCPServer:
             print(f"Error executing command: {str(e)}")
             traceback.print_exc()
             return {"status": "error", "message": str(e)}
+    
+    def _get_valid_node_types(self):
+        """Return a list of valid Nuke node types to prevent crashes."""
+        # Use cached list if available
+        if self._valid_node_types is not None:
+            return self._valid_node_types
+            
+        # Standard Nuke node types that should always be available
+        standard_node_types = [
+            # Input/Output
+            "Read", "Write", "Viewer",
+            # Color
+            "Grade", "ColorCorrect", "Saturation", "HueCorrect", "ColorLookup",
+            # Channel
+            "Shuffle", "ShuffleCopy", "Copy",
+            # Filter
+            "Blur", "Defocus", "Sharpen", "Median", "EdgeBlur",
+            # Keyer
+            "Keyer", "Primatte", "IBKColour", "IBKGizmo", "Keylight",
+            # Merge
+            "Merge2", "Premult", "Unpremult", "Screen", "Plus",
+            # Transform
+            "Transform", "Reformat", "Crop", "CornerPin2D",
+            # 3D
+            "Scene", "Camera", "Light", "Axis", "Card", "Cube", "Sphere", "ScanlineRender",
+            # Deep
+            "DeepMerge", "DeepRecolor",
+            # Misc
+            "Dot", "Switch", "TimeOffset", "NoOp", "Text", "Roto", "RotoPaint",
+            # Special nodes
+            "BackdropNode"
+        ]
+        
+        # Try to get actual node classes from environment if possible
+        try:
+            all_nodes = set(standard_node_types)
+            
+            # Add any nodes from menu
+            try:
+                menu_items = nuke.menu("Nodes").items()
+                for item in menu_items:
+                    if hasattr(item, 'name'):
+                        all_nodes.add(item.name())
+            except:
+                print("Warning: Could not get node types from menu")
+                
+            # Store the combined list
+            self._valid_node_types = list(all_nodes)
+            print(f"Found {len(self._valid_node_types)} valid node types")
+            
+        except Exception as e:
+            # Fallback to standard list
+            print(f"Warning: Using fallback node list due to error: {str(e)}")
+            self._valid_node_types = standard_node_types
+            
+        return self._valid_node_types
+        
+    def _normalize_node_type(self, node_type):
+        """
+        Convert common incorrect node type names to their proper equivalents.
+        Returns the correct node type name or None if no match found.
+        """
+        # Mapping of incorrect to correct node types
+        node_type_corrections = {
+            # Common mistakes
+            "Output": "Write",
+            "WriteNode": "Write",
+            "Input": "Read",
+            "ReadNode": "Read",
+            "Merge": "Merge2",
+            "ColorCorrection": "ColorCorrect",
+            "Color": "Grade",
+            "Grading": "Grade",
+            "Gaussian": "Blur",
+            "GaussianBlur": "Blur",
+            "BlurNode": "Blur",
+            "Premultiply": "Premult", 
+            "PreMult": "Premult",
+            "Unpremultiply": "Unpremult",
+            "UnPreMult": "Unpremult",
+            "Move": "Transform",
+            "Position": "Transform",
+            "Rectangle": "Crop",
+            "CropNode": "Crop",
+        }
+        
+        # Check for exact match first
+        valid_types = self._get_valid_node_types()
+        if node_type in valid_types:
+            return node_type
+            
+        # Check for known corrections
+        if node_type in node_type_corrections:
+            corrected_type = node_type_corrections[node_type]
+            print(f"Corrected node type '{node_type}' to '{corrected_type}'")
+            return corrected_type
+            
+        # No correction found
+        return None
+        
+    def _validate_node_name(self, name):
+        """
+        Validate a node name to prevent problematic naming patterns.
+        Returns a safe version of the name.
+        """
+        if not name:
+            return None
+        
+        # Check if name starts with a number
+        if name[0].isdigit():
+            print(f"Warning: Node name '{name}' starts with a number, which can cause issues")
+            # Prefix with a safe character (n_)
+            name = f"n_{name}"
+        
+        # Replace any invalid characters
+        # Nuke node names should only contain alphanumeric and underscore
+        import re
+        safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+        
+        if safe_name != name:
+            print(f"Warning: Node name '{name}' contained invalid characters, using '{safe_name}' instead")
+        
+        return safe_name
     
     def get_script_info(self):
         """Get information about the current Nuke script"""
@@ -187,7 +329,7 @@ class NukeMCPServer:
             return {"error": str(e)}
     
     def create_node(self, node_type, name=None, position=None, inputs=None, parameters=None):
-        """Create a new node in Nuke"""
+        """Create a new node in Nuke with improved stability"""
         try:
             # Default parameters
             if position is None:
@@ -195,36 +337,116 @@ class NukeMCPServer:
             if parameters is None:
                 parameters = {}
             
-            # Create the node
-            node = nuke.createNode(node_type, inpanel=False)
+            # Normalize node type - handle common mistakes
+            corrected_node_type = self._normalize_node_type(node_type)
+            if corrected_node_type and corrected_node_type != node_type:
+                print(f"Automatically corrected node type from '{node_type}' to '{corrected_node_type}'")
+                node_type = corrected_node_type
+            
+            # Validate node type before attempting creation
+            valid_node_types = self._get_valid_node_types()
+            if node_type not in valid_node_types:
+                import difflib
+                similar_types = difflib.get_close_matches(node_type, valid_node_types, n=3, cutoff=0.6)
+                
+                error_msg = f"Invalid node type: '{node_type}'"
+                if similar_types:
+                    error_msg += f". Did you mean one of these: {', '.join(similar_types)}?"
+                else:
+                    error_msg += f". Valid types include: {', '.join(sorted(valid_node_types[:10]))}..."
+                
+                raise ValueError(error_msg)
+            
+            # Special case for BackdropNode which requires a different creation pattern
+            if node_type == "BackdropNode":
+                node = nuke.nodes.BackdropNode(
+                    xpos=position[0],
+                    ypos=position[1]
+                )
+            else:
+                # Standard node creation
+                node = nuke.createNode(node_type, inpanel=False)
+            
+            # Verify node was created
+            if not node:
+                raise ValueError(f"Failed to create node of type {node_type}")
             
             # Set name if provided
             if name:
-                existing = nuke.toNode(name)
-                if existing:
-                    suffix = 1
-                    while nuke.toNode(f"{name}_{suffix}"):
-                        suffix += 1
-                    name = f"{name}_{suffix}"
-                node.setName(name)
+                safe_name = self._validate_node_name(name)
+                if safe_name:
+                    # Check if name already exists
+                    existing = nuke.toNode(safe_name)
+                    if existing:
+                        suffix = 1
+                        while nuke.toNode(f"{safe_name}_{suffix}"):
+                            suffix += 1
+                        safe_name = f"{safe_name}_{suffix}"
+                    
+                    node.setName(safe_name)
             
             # Set position
             node.setXYpos(position[0], position[1])
             
-            # Set parameters
+            # Set parameters - only if they exist, with type conversion
             for param_name, param_value in parameters.items():
-                try:
-                    node[param_name].setValue(param_value)
-                except Exception as e:
-                    print(f"Error setting parameter {param_name}: {str(e)}")
+                # CRITICAL: Verify the parameter exists before setting
+                if param_name in node.knobs():
+                    try:
+                        # Get knob class to handle type conversion properly
+                        knob = node[param_name]
+                        knob_class = knob.Class()
+                        
+                        # Handle different knob types with appropriate type conversion
+                        if knob_class in ["Int_Knob", "WH_Knob"] and isinstance(param_value, str):
+                            # Try to convert string to int for integer knobs
+                            try:
+                                node[param_name].setValue(int(param_value))
+                                print(f"Converted string '{param_value}' to int for parameter {param_name}")
+                            except ValueError:
+                                print(f"Warning: Could not convert '{param_value}' to int for {param_name}")
+                        elif knob_class in ["Double_Knob", "XY_Knob", "XYZ_Knob", "AColor_Knob", "WH_Knob"] and isinstance(param_value, str):
+                            # Try to convert string to float for float knobs
+                            try:
+                                node[param_name].setValue(float(param_value))
+                                print(f"Converted string '{param_value}' to float for parameter {param_name}")
+                            except ValueError:
+                                print(f"Warning: Could not convert '{param_value}' to float for {param_name}")
+                        elif knob_class == "Boolean_Knob" and isinstance(param_value, str):
+                            # Convert string to boolean
+                            bool_value = param_value.lower() in ["true", "yes", "1", "on"]
+                            node[param_name].setValue(bool_value)
+                            print(f"Converted string '{param_value}' to boolean {bool_value} for parameter {param_name}")
+                        elif knob_class in ["Color_Knob", "AColor_Knob"] and isinstance(param_value, list):
+                            # Handle color knobs (list of floats)
+                            for i, comp in enumerate(param_value):
+                                if i < 4:  # RGBA has max 4 components
+                                    if isinstance(comp, str):
+                                        try:
+                                            node[param_name].setValue(float(comp), i)
+                                        except ValueError:
+                                            print(f"Warning: Could not convert '{comp}' to float for {param_name}[{i}]")
+                                    else:
+                                        node[param_name].setValue(comp, i)
+                        else:
+                            # Default setting
+                            node[param_name].setValue(param_value)
+                    except Exception as e:
+                        print(f"Warning: Error setting parameter {param_name} to {param_value}: {str(e)}")
+                        traceback.print_exc()
+                        # Continue with other parameters instead of failing
+                else:
+                    print(f"Warning: Parameter {param_name} does not exist on {node_type}")
             
-            # Connect inputs if specified
+            # Connect inputs only AFTER all parameters are set
             if inputs:
                 for input_idx, input_name in enumerate(inputs):
                     if input_name:
                         input_node = nuke.toNode(input_name)
                         if input_node:
                             node.setInput(input_idx, input_node)
+                        else:
+                            print(f"Warning: Input node {input_name} not found")
             
             # Return node information
             return {
@@ -233,6 +455,8 @@ class NukeMCPServer:
                 "position": [node.xpos(), node.ypos()],
             }
         except Exception as e:
+            print(f"Error creating node: {str(e)}")
+            traceback.print_exc()
             raise Exception(f"Failed to create node: {str(e)}")
     
     def modify_node(self, name, parameters=None, position=None, inputs=None):
@@ -247,21 +471,23 @@ class NukeMCPServer:
             if position:
                 node.setXYpos(position[0], position[1])
             
-            # Set parameters if provided
+            # Set parameters if provided - only if they exist
             if parameters:
                 for param_name, param_value in parameters.items():
-                    try:
+                    if param_name in node.knobs():
                         node[param_name].setValue(param_value)
-                    except Exception as e:
-                        print(f"Error setting parameter {param_name}: {str(e)}")
+                    else:
+                        print(f"Warning: Parameter {param_name} does not exist on {node.Class()}")
             
-            # Connect inputs if specified
+            # Connect inputs if specified - only after other modifications
             if inputs:
                 for input_idx, input_name in enumerate(inputs):
                     if input_name:
                         input_node = nuke.toNode(input_name)
                         if input_node:
                             node.setInput(input_idx, input_node)
+                        else:
+                            print(f"Warning: Input node {input_name} not found")
                     else:
                         # Disconnect input if None
                         node.setInput(input_idx, None)
@@ -287,6 +513,8 @@ class NukeMCPServer:
             
             return node_info
         except Exception as e:
+            print(f"Error modifying node: {str(e)}")
+            traceback.print_exc()
             raise Exception(f"Failed to modify node: {str(e)}")
             
     def delete_node(self, name):
@@ -309,6 +537,8 @@ class NukeMCPServer:
                 "type": node_type
             }
         except Exception as e:
+            print(f"Error deleting node: {str(e)}")
+            traceback.print_exc()
             raise Exception(f"Failed to delete node: {str(e)}")
     
     def position_node(self, name, position):
@@ -327,6 +557,8 @@ class NukeMCPServer:
                 "position": [node.xpos(), node.ypos()]
             }
         except Exception as e:
+            print(f"Error positioning node: {str(e)}")
+            traceback.print_exc()
             raise Exception(f"Failed to position node: {str(e)}")
     
     def connect_nodes(self, output_node, input_node, input_index=0):
@@ -350,6 +582,8 @@ class NukeMCPServer:
                 "input_index": input_index
             }
         except Exception as e:
+            print(f"Error connecting nodes: {str(e)}")
+            traceback.print_exc()
             raise Exception(f"Failed to connect nodes: {str(e)}")
     
     def render(self, frame_range=None, write_node=None, proxy_mode=False):
@@ -365,6 +599,9 @@ class NukeMCPServer:
             if frame_range:
                 # Parse frame range string to get the frames to render
                 frames = self._parse_frame_range(frame_range)
+                if not frames:
+                    raise ValueError(f"Invalid frame range: {frame_range}")
+                    
                 start_frame = frames[0]
                 end_frame = frames[-1]
             else:
@@ -405,22 +642,27 @@ class NukeMCPServer:
                 }
             
         except Exception as e:
+            print(f"Render error: {str(e)}")
+            traceback.print_exc()
             raise Exception(f"Render error: {str(e)}")
     
     def _parse_frame_range(self, frame_range_str):
         """Parse a frame range string like '1-5,7,9-12'"""
         frames = []
-        parts = frame_range_str.split(',')
+        try:
+            parts = frame_range_str.split(',')
+            
+            for part in parts:
+                if '-' in part:
+                    # Range of frames
+                    start, end = map(int, part.split('-'))
+                    frames.extend(range(start, end + 1))
+                else:
+                    # Single frame
+                    frames.append(int(part))
+        except ValueError as e:
+            print(f"Error parsing frame range: {str(e)}")
         
-        for part in parts:
-            if '-' in part:
-                # Range of frames
-                start, end = map(int, part.split('-'))
-                frames.extend(range(start, end + 1))
-            else:
-                # Single frame
-                frames.append(int(part))
-                
         return sorted(frames)
     
     def viewer_playback(self, action="play", start_frame=None, end_frame=None, viewer_index=1):
@@ -452,47 +694,85 @@ class NukeMCPServer:
                 raise ValueError(f"Unknown playback action: {action}")
         
         except Exception as e:
+            print(f"Viewer playback error: {str(e)}")
+            traceback.print_exc()
             raise Exception(f"Viewer playback error: {str(e)}")
     
     def execute_code(self, code):
-        """Execute arbitrary Python code in Nuke"""
+        """Execute arbitrary Python code in Nuke with safety measures"""
         try:
+            if not code.strip():
+                return {"executed": False, "error": "Empty code provided"}
+            
             # Create a dictionary to capture output
             output = {}
             
-            # Create a local namespace for execution
-            namespace = {"nuke": nuke, "output": output}
+            # Create a local namespace for execution with safety
+            namespace = {"nuke": nuke, "nukescripts": nukescripts, "output": output}
             
-            # Execute the code
-            exec(code, namespace)
-            
-            return {
-                "executed": True,
-                "output": output
-            }
+            # Execute the code with safety wrapper
+            try:
+                exec(code, namespace)
+                return {"executed": True, "output": output}
+            except Exception as e:
+                error_tb = traceback.format_exc()
+                print(f"Code execution error: {str(e)}")
+                print(error_tb)
+                return {"executed": False, "error": str(e), "traceback": error_tb}
         except Exception as e:
-            raise Exception(f"Code execution error: {str(e)}")
+            print(f"Error in execute_code setup: {str(e)}")
+            traceback.print_exc()
+            return {"executed": False, "error": str(e)}
     
     def auto_layout(self, selected_only=False):
         """Automatically arrange nodes in the script"""
         try:
-            if selected_only:
-                # Get selected nodes
-                nodes = [n for n in nuke.allNodes() if n.isSelected()]
-                if not nodes:
-                    return {"status": "No nodes selected"}
+            # Improved auto_layout implementation that avoids the "expecting a Nuke node type" error
+            auto_layout_code = f"""
+import nuke
+
+def auto_layout_nodes(selected_only={selected_only}):
+    # Automatically arrange nodes in the script
+    try:
+        if selected_only:
+            # Get selected nodes
+            nodes = [n for n in nuke.allNodes() if n.isSelected()]
+            if not nodes:
+                return "No nodes selected"
+        else:
+            # Get all nodes
+            nodes = nuke.allNodes()
+        
+        # Use Nuke's auto placement function for individual nodes
+        for node in nodes:
+            try:
+                # Call autoplace on each individual node
+                nuke.autoplace(node)
+            except Exception as e:
+                print(f"Warning: could not auto-place node {{node.name()}}: {{str(e)}}")
+        
+        return f"Auto-arranged {{len(nodes)}} nodes"
+    except Exception as e:
+        return f"Auto layout error: {{str(e)}}"
+
+# Execute the function
+result = auto_layout_nodes()
+output["status"] = result
+            """
+            
+            # Execute the code
+            result = self.execute_code(auto_layout_code)
+            
+            if result.get("executed", False):
+                output = result.get("output", {})
+                status = output.get("status", "Nodes arranged")
+                return {"status": status}
             else:
-                # Get all nodes
-                nodes = nuke.allNodes()
-            
-            # Use Nuke's auto placement function
-            nuke.autoplace(nodes)
-            
-            return {
-                "status": f"Auto-arranged {len(nodes)} nodes",
-                "selected_only": selected_only
-            }
+                error = result.get("error", "Unknown error")
+                raise Exception(f"Failed to auto-layout nodes: {error}")
         except Exception as e:
+            print(f"Auto layout error: {str(e)}")
+            traceback.print_exc()
             raise Exception(f"Auto layout error: {str(e)}")
     
     def get_node_info(self, name):
@@ -548,11 +828,14 @@ class NukeMCPServer:
                                 "value": value,
                                 "type": k.Class()
                             }
-                except:
+                except Exception as e:
+                    print(f"Error getting parameter {knob}: {str(e)}")
                     pass
             
             return node_info
         except Exception as e:
+            print(f"Error getting node info: {str(e)}")
+            traceback.print_exc()
             raise Exception(f"Failed to get node info: {str(e)}")
     
     def set_frames(self, first_frame=None, last_frame=None, current_frame=None):
@@ -576,13 +859,23 @@ class NukeMCPServer:
                 "current_frame": nuke.frame()
             }
         except Exception as e:
+            print(f"Error setting frames: {str(e)}")
+            traceback.print_exc()
             raise Exception(f"Failed to set frames: {str(e)}")
     
     def create_viewer(self, input_node=None):
         """Create a Viewer node connected to the specified input node"""
         try:
-            # Create the Viewer node
-            viewer = nuke.createNode("Viewer", inpanel=False)
+            # Create the Viewer node - Viewer nodes should use nuke.nodes.Viewer() for stability
+            try:
+                viewer = nuke.nodes.Viewer()
+                
+                # Set position to a default offscreen value to avoid overlapping with other nodes
+                viewer.setXYpos(0, -300)
+            except Exception as e:
+                print(f"Error creating Viewer using nuke.nodes.Viewer(): {str(e)}")
+                # Fallback to regular createNode method
+                viewer = nuke.createNode("Viewer", inpanel=False)
             
             # Connect to input node if specified
             if input_node:
@@ -598,9 +891,10 @@ class NukeMCPServer:
                 "connected_to": input_node
             }
         except Exception as e:
+            print(f"Error creating viewer: {str(e)}")
+            traceback.print_exc()
             raise Exception(f"Failed to create viewer: {str(e)}")
 
-# Nuke panel for controlling the server
 class NukeMCPPanel(nukescripts.PythonPanel):
     def __init__(self):
         nukescripts.PythonPanel.__init__(self, 'Nuke MCP', 'com.example.NukeMCP')
