@@ -1069,6 +1069,3 @@ def show_panel():
     
     # Show as a regular panel
     _panel.show()
-
-# Note: The menu item is handled in menu.py
-# nuke.menu('Nuke').addCommand('NukeMCP/Show Panel', show_panel)
