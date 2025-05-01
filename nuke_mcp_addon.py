@@ -137,7 +137,7 @@ class NukeMCPServer:
             time.sleep(0.1)
 
     def execute_command(self, command):
-        """Execute a command received from the client"""
+        """Execute a command received from the client with improved error handling"""
         try:
             cmd_type = command.get("type")
             params = command.get("params", {})
@@ -162,23 +162,41 @@ class NukeMCPServer:
             if handler:
                 try:
                     print(f"Executing handler for {cmd_type}")
+                    
+                    # Set up timing to monitor long-running operations
+                    import time
+                    start_time = time.time()
+                    
+                    # Execute the handler
                     result = handler(**params)
-                    print(f"Handler execution complete")
+                    
+                    # Log execution time for performance monitoring
+                    elapsed_time = time.time() - start_time
+                    print(f"Handler execution complete in {elapsed_time:.2f} seconds")
+                    
                     return {"status": "success", "result": result}
                 except Exception as e:
+                    import traceback
+                    error_tb = traceback.format_exc()
                     print(f"Error in handler: {str(e)}")
-                    traceback.print_exc()
-                    return {"status": "error", "message": str(e)}
-                except Exception as e:
-                    print(f"Error in handler: {str(e)}")
-                    traceback.print_exc()
-                    return {"status": "error", "message": str(e)}
+                    print(error_tb)
+                    return {
+                        "status": "error", 
+                        "message": str(e),
+                        "traceback": error_tb
+                    }
             else:
                 return {"status": "error", "message": f"Unknown command type: {cmd_type}"}
         except Exception as e:
+            import traceback
+            error_tb = traceback.format_exc()
             print(f"Error executing command: {str(e)}")
-            traceback.print_exc()
-            return {"status": "error", "message": str(e)}
+            print(error_tb)
+            return {
+                "status": "error", 
+                "message": str(e),
+                "traceback": error_tb
+            }
             
     def _validate_node_name(self, name):
         """
@@ -232,20 +250,96 @@ class NukeMCPServer:
             print(f"Error in get_script_info: {str(e)}")
             traceback.print_exc()
             return {"error": str(e)}
+            
+    def _get_valid_node_types(self):
+        """Return a list of valid Nuke node types with fallback options."""
+        # Cache this list to avoid regenerating it each time
+        if not hasattr(self, '_valid_node_types'):
+            # Standard Nuke node types that should always be available
+            standard_node_types = [
+                # Input/Output
+                "Read", "Write", "Viewer",
+                # Color
+                "Grade", "ColorCorrect", "Saturation", "HueCorrect", "ColorLookup",
+                # Channel
+                "Shuffle", "ShuffleCopy", "Copy",
+                # Filter
+                "Blur", "Defocus", "Sharpen", "Median", "EdgeBlur",
+                # Keyer
+                "Keyer", "Primatte", "IBKColour", "IBKGizmo", "Keylight",
+                # Merge
+                "Merge2", "Premult", "Unpremult", "Screen", "Plus",
+                # Transform
+                "Transform", "Reformat", "Crop", "CornerPin2D",
+                # 3D
+                "Scene", "Camera", "Light", "Axis",
+                # Deep
+                "DeepMerge", "DeepRecolor",
+                # Misc
+                "Dot", "Switch", "TimeOffset", "NoOp", "Text", "Roto", "RotoPaint"
+            ]
+            
+            # Get additional node types from the environment if possible
+            try:
+                # Method 1: Get standard node types from the menu 
+                menu_nodes = set()
+                try:
+                    for menu_item in nuke.menu("Nodes").items():
+                        if hasattr(menu_item, 'name'):
+                            menu_nodes.add(menu_item.name())
+                except:
+                    print("Warning: Could not get node types from menu")
+                
+                # Method 2: Get node types from the nuke.nodes module
+                code_nodes = set()
+                try:
+                    for name in dir(nuke.nodes):
+                        if not name.startswith('_'):
+                            code_nodes.add(name)
+                except:
+                    print("Warning: Could not get node types from nuke.nodes")
+                
+                # Combine all sources with the standard list having priority
+                all_nodes = set(standard_node_types).union(menu_nodes).union(code_nodes)
+                self._valid_node_types = list(all_nodes)
+                
+                # Debug info
+                print(f"Found {len(self._valid_node_types)} valid node types")
+            except Exception as e:
+                # Fallback to standard nodes if there's any error
+                print(f"Warning: Using fallback node list due to error: {str(e)}")
+                self._valid_node_types = standard_node_types
+        
+        return self._valid_node_types
     
     def create_node(self, node_type, name=None, position=None, inputs=None, parameters=None):
-        """Create a new node in Nuke with improved error handling and name validation"""
+        """Create a new node in Nuke with improved error handling and type validation"""
         try:
             # Default parameters
             if position is None:
                 position = [0, 0]
+            # Ensure position is a list, not a tuple
+            elif isinstance(position, tuple):
+                position = list(position)
+                
             if parameters is None:
                 parameters = {}
             
-            # Validate node type exists before creating
-            if node_type not in dir(nuke.nodes):
-                known_types = [t for t in dir(nuke.nodes) if not t.startswith('_')]
-                raise ValueError(f"Unknown node type: {node_type}. Available types include: {', '.join(known_types[:10])}...")
+            # Enhanced node type validation
+            valid_node_types = self._get_valid_node_types()
+            
+            if node_type not in valid_node_types:
+                # Provide helpful suggestions for similar node types
+                import difflib
+                similar_types = difflib.get_close_matches(node_type, valid_node_types, n=5, cutoff=0.6)
+                
+                error_msg = f"Invalid node type: '{node_type}'"
+                if similar_types:
+                    error_msg += f". Did you mean one of these: {', '.join(similar_types)}?"
+                else:
+                    error_msg += f". Valid types include: {', '.join(sorted(valid_node_types[:10]))}..."
+                    
+                raise ValueError(error_msg)
             
             print(f"Creating node of type {node_type}")
             
@@ -263,7 +357,6 @@ class NukeMCPServer:
                 
             print(f"Node created successfully: {node.name()}")
             
-            # *** CHANGE 1: Validate name before setting it ***
             # Set name if provided
             if name:
                 try:
@@ -282,20 +375,23 @@ class NukeMCPServer:
                         node.setName(safe_name)
                         print(f"Set node name to: {safe_name}")
                         
-                        # *** CHANGE 2: If name was modified, add original as label ***
+                        # If name was modified, add original as label
                         if safe_name != name and "label" not in parameters:
                             try:
                                 node["label"].setValue(name)
                                 print(f"Set node label to original name: {name}")
-                            except:
-                                pass
+                            except Exception as e:
+                                print(f"Could not set label to original name: {str(e)}")
                 except Exception as e:
                     print(f"Warning: Could not set node name to {name}: {str(e)}")
             
             # Set position with error handling
             try:
-                node.setXYpos(position[0], position[1])
-                print(f"Set node position to: {position}")
+                # Ensure position is a list of two integers
+                x_pos = int(position[0]) if position and len(position) > 0 else 0
+                y_pos = int(position[1]) if position and len(position) > 1 else 0
+                node.setXYpos(x_pos, y_pos)
+                print(f"Set node position to: [{x_pos}, {y_pos}]")
             except Exception as e:
                 print(f"Warning: Could not set position to {position}: {str(e)}")
             
@@ -348,26 +444,42 @@ class NukeMCPServer:
             
             # Set position if provided
             if position:
-                node.setXYpos(position[0], position[1])
+                try:
+                    node.setXYpos(position[0], position[1])
+                    print(f"Set position of {name} to {position}")
+                except Exception as e:
+                    print(f"Error setting position: {str(e)}")
             
             # Set parameters if provided
             if parameters:
                 for param_name, param_value in parameters.items():
                     try:
+                        if param_name not in node.knobs():
+                            print(f"Warning: Parameter {param_name} does not exist on {node.Class()} node")
+                            continue
+                            
                         node[param_name].setValue(param_value)
+                        print(f"Set parameter {param_name} = {param_value} on {name}")
                     except Exception as e:
                         print(f"Error setting parameter {param_name}: {str(e)}")
             
             # Connect inputs if specified
             if inputs:
                 for input_idx, input_name in enumerate(inputs):
-                    if input_name:
-                        input_node = nuke.toNode(input_name)
-                        if input_node:
-                            node.setInput(input_idx, input_node)
-                    else:
-                        # Disconnect input if None
-                        node.setInput(input_idx, None)
+                    try:
+                        if input_name:
+                            input_node = nuke.toNode(input_name)
+                            if input_node:
+                                node.setInput(input_idx, input_node)
+                                print(f"Connected input {input_idx} of {name} to {input_name}")
+                            else:
+                                print(f"Warning: Could not find input node {input_name}")
+                        else:
+                            # Disconnect input if None
+                            node.setInput(input_idx, None)
+                            print(f"Disconnected input {input_idx} of {name}")
+                    except Exception as e:
+                        print(f"Error connecting input {input_idx}: {str(e)}")
             
             # Return updated node information
             node_info = {
@@ -385,11 +497,15 @@ class NukeMCPServer:
                         # Only include simple parameter types
                         if isinstance(value, (int, float, str, bool)):
                             node_info["parameters"][knob] = value
-                except:
-                    pass
+                except Exception as e:
+                    print(f"Error getting parameter {knob}: {str(e)}")
             
             return node_info
         except Exception as e:
+            import traceback
+            error_tb = traceback.format_exc()
+            print(f"Failed to modify node: {str(e)}")
+            print(error_tb)
             raise Exception(f"Failed to modify node: {str(e)}")
     
     def position_node(self, name, position):
@@ -536,18 +652,113 @@ class NukeMCPServer:
             raise Exception(f"Viewer playback error: {str(e)}")
     
     def execute_code(self, code=""):
-        """Execute Python code in Nuke with improved error handling"""
+        """Execute Python code in Nuke with comprehensive safety measures and error handling"""
+        # Generate a unique ID for this execution
+        import time
+        import random
+        import traceback  # Import traceback at the method beginning
+        execution_id = f"exec_{int(time.time())}_{random.randint(1000, 9999)}"
+        
         try:
-            print(f"Executing Python code: {len(code)} characters")
+            print(f"[{execution_id}] Executing Python code: {len(code)} characters")
             
-            # Import any modules needed for the namespace
+            # 1. Code validation/sanitization
+            if not code.strip():
+                return {"executed": False, "error": "Empty code provided"}
+            
+            # 2. Check for potentially dangerous operations
+            dangerous_patterns = [
+                "shutil.rmtree", "os.rmdir", "os.remove",  # File deletion
+                "sys.exit", "os._exit", "quit",  # Program termination
+                "subprocess.call", "subprocess.Popen", "os.system",  # Command execution
+                "socket.socket", "urllib",  # Network operations
+                "exec(", "eval("  # Dynamic code execution
+            ]
+            
+            for pattern in dangerous_patterns:
+                if pattern in code:
+                    warning_msg = f"Warning: Code contains potentially unsafe operation: {pattern}"
+                    print(f"[{execution_id}] {warning_msg}")
+                    # Don't block execution, but log the warning
+            
+            # 3. Pre-validate code for common Nuke errors
+            import re
+            
+            # Get list of valid node types
+            if hasattr(self, '_get_valid_node_types'):
+                try:
+                    valid_node_types = self._get_valid_node_types()
+                    
+                    # Check for node creation patterns
+                    node_creation_patterns = [
+                        r'nuke\.createNode\s*\(\s*["\']([^"\']+)["\']',  # nuke.createNode("NodeType")
+                        r'nuke\.nodes\.([A-Za-z0-9_]+)\s*\(',            # nuke.nodes.NodeType()
+                    ]
+                    
+                    warnings = []
+                    for pattern in node_creation_patterns:
+                        matches = re.finditer(pattern, code)
+                        for match in matches:
+                            node_type = match.group(1)
+                            if node_type not in valid_node_types:
+                                # Find similar node types for suggestions
+                                import difflib
+                                similar_types = difflib.get_close_matches(node_type, valid_node_types, n=3, cutoff=0.6)
+                                
+                                warning = f"Warning: Potentially invalid node type '{node_type}'"
+                                if similar_types:
+                                    warning += f". Did you mean: {', '.join(similar_types)}?"
+                                warnings.append(warning)
+                    
+                    # Check for risky node parameter access
+                    risky_params = [
+                        r'node\[["\']([^"\']+)["\']\]\.setValue',  # Setting parameters directly
+                    ]
+                    
+                    for pattern in risky_params:
+                        matches = re.finditer(pattern, code)
+                        for match in matches:
+                            param_name = match.group(1)
+                            if param_name not in ["label", "name", "hide_input", "tile_color", 
+                                                 "gl_color", "note_font_size", "selected"]:
+                                warning = f"Warning: Setting parameter '{param_name}' without existence check"
+                                warnings.append(warning)
+                    
+                    # Check for diagonal node positioning
+                    if re.search(r'x\s*\+=.*y\s*\+=', code) or re.search(r'setXYpos\s*\([^,)]*\+[^,)]*,\s*[^,)]*\+', code):
+                        warning = "Warning: Detected diagonal node positioning pattern, consider vertical stacking for cleaner graphs"
+                        warnings.append(warning)
+                    
+                    # Log all warnings
+                    if warnings:
+                        print("Pre-execution code analysis warnings:")
+                        for warning in warnings:
+                            print(f"  - {warning}")
+                except Exception as e:
+                    print(f"Warning: Error during code pre-validation: {str(e)}")
+            
+            # 4. Memory usage tracking (cross-platform version)
+            has_resource = False
+            initial_memory = 0
+            try:
+                # Try to use resource module (Unix/Mac)
+                import resource
+                initial_memory = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                has_resource = True
+            except ImportError:
+                # Fall back to simple tracking on Windows
+                has_resource = False
+                print("Resource module not available (Windows) - memory tracking disabled")
+            
+            # 5. Import any modules needed for the namespace
             import os
             import sys
             import math
             import random
-            import time
+            # Add textwrap module for code indentation
+            import textwrap
             
-            # Create a namespace with access to nuke and standard modules
+            # 6. Create a namespace with access to nuke and standard modules
             namespace = {
                 'nuke': nuke,
                 'nukescripts': nukescripts,
@@ -556,48 +767,99 @@ class NukeMCPServer:
                 'math': math,
                 'random': random,
                 'time': time,
-                'output': {}  # Container for output data
+                'traceback': traceback,  # Now traceback is defined
+                'output': {},  # Container for output data
+                'execution_id': execution_id  # Make ID available to code
             }
             
-            # Add print output capturing
+            # 7. Add print output capturing
             old_stdout = sys.stdout
             string_io = io.StringIO()
             sys.stdout = string_io
             
             try:
-                # Execute the code
-                exec(code, namespace)
+                # 8. Safer code execution with prepended safety measures
+                # Wrap the code in a function to catch returns and limit scope
+                wrapped_code = f"""
+    # Safety wrapper for execution {execution_id}
+    def __execute_with_safety():
+        try:
+            # User code begins
+    {textwrap.indent(code, '        ')}
+            # User code ends
+        except Exception as e:
+            import traceback
+            print(f"[{execution_id}] Error in execution: {{str(e)}}")
+            print(traceback.format_exc())
+            output['error'] = str(e)
+            output['traceback'] = traceback.format_exc()
+            return False
+        return True
+
+    # Execute the wrapped code
+    __execution_success = __execute_with_safety()
+    output['success'] = __execution_success
+    """
+                # Execute the safer wrapped code
+                exec(wrapped_code, namespace)
+                
+                # Capture stdout
                 namespace['output']['stdout'] = string_io.getvalue()
                 
-                # Return successful execution
+                # Check memory usage (cross-platform)
+                if has_resource:
+                    try:
+                        final_memory = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                        memory_diff = final_memory - initial_memory
+                        namespace['output']['memory_usage'] = {
+                            'initial_kb': initial_memory,
+                            'final_kb': final_memory,
+                            'diff_kb': memory_diff
+                        }
+                        
+                        # Check for excessive memory usage
+                        if memory_diff > 1024 * 100:  # 100 MB increase
+                            print(f"[{execution_id}] Warning: High memory usage detected: {memory_diff/1024:.2f} MB")
+                            namespace['output']['high_memory_warning'] = True
+                    except Exception as e:
+                        print(f"Error tracking memory: {str(e)}")
+                else:
+                    # Skip memory tracking on Windows
+                    namespace['output']['memory_usage'] = {
+                        'note': 'Memory tracking not available on Windows'
+                    }
+                
+                # Return successful execution with comprehensive output
                 return {"executed": True, "output": namespace.get('output', {})}
+                
             except Exception as e:
-                # Log and return the error
+                # Log and return the error with traceback
                 error_msg = f"Code execution error: {str(e)}"
-                import traceback
                 error_traceback = traceback.format_exc()
-                print(error_msg)
+                print(f"[{execution_id}] {error_msg}")
                 print(error_traceback)
+                
                 return {
                     "executed": False, 
                     "error": error_msg,
                     "traceback": error_traceback
                 }
+                
             finally:
                 # Always restore stdout
                 sys.stdout = old_stdout
+                
         except Exception as e:
             # Catch any other errors during setup/teardown
-            import traceback
             error_traceback = traceback.format_exc()
-            print(f"Error in execute_code: {str(e)}")
+            print(f"[{execution_id}] Error in execute_code setup: {str(e)}")
             print(error_traceback)
             return {
                 "executed": False, 
-                "error": f"Error in execute_code: {str(e)}",
+                "error": f"Error in execute_code setup: {str(e)}",
                 "traceback": error_traceback
             }
-    
+        
     def auto_layout(self, selected_only=False):
         """Automatically arrange nodes in the script"""
         try:
