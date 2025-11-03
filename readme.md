@@ -26,6 +26,7 @@ Nuke-MCP allows AI assistants to interact with Nuke through a socket connection,
 - The Foundry's Nuke (any recent version should work)
 - Python 3.7+
 - FastMCP package
+- Claude Desktop
 
 ### Installing the FastMCP package
 
@@ -44,19 +45,22 @@ pip install fastmcp
 
 1. **Copy the Addon File**:
    - Take the `nuke_mcp_addon.py` file and place it in a location where Nuke can find it:
-     - Copy it to your Nuke scripts folder (usually in `~/.nuke` on Linux/Mac or in your home directory on Windows)
+     - Copy it to your Nuke scripts folder (usually in `~/.nuke/python` on Linux/Mac or in your home directory on Windows)
      - Or place it in a folder that's in your Nuke Python path
 
 2. **Create a Startup Script** (Recommended):
    - Create or edit an existing `init.py` file in your `.nuke` directory
-   - Add the following line to automatically load the addon when Nuke starts:
+   - Add the following line to automatically load the addon when Nuke starts and making sure you're pointing to the python subfolder where the MCP tools live:
      ```python
+     nuke.pluginAddPath("./python")
+     
      import nuke_mcp_addon
      ```
 
 3. **Manual Loading** (Alternative):
    - If you don't want to load it automatically, you can manually load it each time by:
      - Opening Nuke
+     - Make sure you have a python subfolder setup in the init.py where the MCP tools live
      - Going to the Script Editor panel
      - Running `import nuke_mcp_addon`
 
@@ -96,7 +100,7 @@ You can also modify how the panel appears in the menu. Based on your menu.py fil
 
 ```python
 # MCP Tools
-nuke.toolbar("Nodes").addCommand('DUGCO/MCP/NukeMCP Panel', 'nuke_mcp_addon.show_panel()')
+nuke.toolbar("Nodes").addCommand('NukeMCP/NukeMCP Panel', 'nuke_mcp_addon.show_panel()')
 ```
 
 To ensure it's properly integrated with your existing toolbar structure, make sure this line is uncommented in your menu.py file.
