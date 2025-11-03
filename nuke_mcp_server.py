@@ -529,12 +529,8 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
             _nuke_connection = None
         logger.info("NukeMCP server shut down")
 
-# Create the MCP server with lifespan support
-mcp = FastMCP(
-    "NukeMCP",
-    description="Nuke integration through the Model Context Protocol",
-    lifespan=server_lifespan
-)
+# Create the MCP server
+mcp = FastMCP("NukeMCP")
 
 @mcp.tool()
 def get_script_info(ctx: Context) -> str:
