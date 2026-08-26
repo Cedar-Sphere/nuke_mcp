@@ -43,6 +43,77 @@ def encode_message(payload):
     ).encode("utf-8")
 
 
+_PRIMITIVES = (bool, int, float, str)
+
+
+def _as_reportable(value):
+    """Reduce a knob value to something JSON can encode.
+
+    Returns ``(ok, value)``. Anything that would only encode as an object repr
+    is rejected rather than reported, so callers never see ``<Foo object at
+    0x...>`` in place of real data.
+    """
+    if value is None or isinstance(value, _PRIMITIVES):
+        return True, value
+    if isinstance(value, (list, tuple)):
+        items = []
+        for item in value:
+            if item is not None and not isinstance(item, _PRIMITIVES):
+                return False, None
+            items.append(item)
+        return True, items
+    return False, None
+
+
+def knob_value(knob):
+    """Best-effort JSON-safe value for a Nuke knob.
+
+    Multi-component knobs report every component. Nuke exposes a Grade's white
+    and gamma as AColor_Knob with four components, and reading only ``value()``
+    collapses them to the first channel.
+    """
+    array_size = getattr(knob, "arraySize", None)
+    if callable(array_size):
+        try:
+            size = array_size()
+        except Exception:
+            size = None
+        if isinstance(size, int) and size > 1:
+            try:
+                return _as_reportable([knob.value(i) for i in range(size)])
+            except Exception:
+                pass
+
+    try:
+        return _as_reportable(knob.value())
+    except Exception:
+        return False, None
+
+
+def format_description(fmt):
+    """Describe a Nuke Format. Its __str__ is only an object repr."""
+    if fmt is None:
+        return None
+
+    try:
+        name = fmt.name()
+    except Exception:
+        name = None
+
+    try:
+        dimensions = "%dx%d" % (fmt.width(), fmt.height())
+    except Exception:
+        dimensions = None
+
+    if name and dimensions:
+        return "%s (%s)" % (name, dimensions)
+    if name:
+        return name
+    if dimensions:
+        return dimensions
+    return str(fmt)
+
+
 class NukeMCPServer:
     def __init__(self, host=None, port=None):
         host = DEFAULT_HOST if host is None else host
@@ -529,7 +600,7 @@ class NukeMCPServer:
             script_info = {
                 "name": nuke.root().name(),
                 "fps": nuke.root().fps(),
-                "format": str(nuke.root().format()),
+                "format": format_description(nuke.root().format()),
                 "first_frame": nuke.root()["first_frame"].value(),
                 "last_frame": nuke.root()["last_frame"].value(),
                 "nodes": [],
@@ -1030,32 +1101,22 @@ output["status"] = result
                 else:
                     node_info["inputs"].append(None)
             
-            # Get parameters (knobs)
+            # Get parameters (knobs). Values are read generically rather than by
+            # whitelisting knob classes, which used to drop every colour knob.
             for knob in node.knobs():
                 try:
-                    if node[knob].visible():
-                        k = node[knob]
-                        
-                        # Get the value based on knob type
-                        value = None
-                        if k.Class() in ["Int_Knob", "Double_Knob", "Boolean_Knob", "String_Knob"]:
-                            value = k.value()
-                        elif k.Class() == "XY_Knob":
-                            value = [k.value(0), k.value(1)]
-                        elif k.Class() == "XYZ_Knob":
-                            value = [k.value(0), k.value(1), k.value(2)]
-                        elif k.Class() == "Color_Knob":
-                            value = [k.value(0), k.value(1), k.value(2), k.value(3)]
-                        
-                        # Only include parameter if we could get a value
-                        if value is not None:
-                            node_info["parameters"][knob] = {
-                                "value": value,
-                                "type": k.Class()
-                            }
+                    k = node[knob]
+                    if not k.visible():
+                        continue
+
+                    ok, value = knob_value(k)
+                    if ok:
+                        node_info["parameters"][knob] = {
+                            "value": value,
+                            "type": k.Class(),
+                        }
                 except Exception as e:
                     print(f"Error getting parameter {knob}: {str(e)}")
-                    pass
             
             return node_info
         except Exception as e:
