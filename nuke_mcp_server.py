@@ -3,16 +3,87 @@ import socket
 import json
 import asyncio
 import logging
+import sys
 import time
 import os
-from dataclasses import dataclass
+import threading
+import uuid
+from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List, Optional, Union
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG, 
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("NukeMCPServer")
+MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+# The addon reads the same two variables, so both sides stay in step when a
+# non-default port is used.
+NUKE_HOST = os.getenv("NUKE_MCP_HOST", "localhost")
+NUKE_PORT = int(os.getenv("NUKE_MCP_PORT", "9876"))
+CONNECT_TIMEOUT_SECONDS = float(os.getenv("NUKE_MCP_CONNECT_TIMEOUT", "5"))
+COMMAND_TIMEOUT_SECONDS = float(os.getenv("NUKE_MCP_COMMAND_TIMEOUT", "30"))
+RENDER_TIMEOUT_SECONDS = float(os.getenv("NUKE_MCP_RENDER_TIMEOUT", "3600"))
+
+
+class ProtocolError(Exception):
+    """Raised when the addon response violates the wire protocol."""
+
+
+class NukeCommandError(Exception):
+    """Raised when the addon returns a structured command error."""
+
+    def __init__(self, error_type: str, message: str):
+        self.error_type = error_type
+        self.message = message
+        super().__init__(f"{error_type}: {message}")
+
+
+LOGGER_NAME = "NukeMCPServer"
+LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+_logging_configured = False
+
+
+def _resolve_log_level() -> int:
+    level_name = os.getenv("NUKE_MCP_LOG_LEVEL", "INFO").upper()
+    return getattr(logging, level_name, logging.INFO)
+
+
+def configure_logging() -> logging.Logger:
+    """Configure application logging to stderr for stdio-safe MCP transport."""
+    global _logging_configured
+    level = _resolve_log_level()
+    app_logger = logging.getLogger(LOGGER_NAME)
+    app_logger.setLevel(level)
+    app_logger.propagate = False
+
+    if not app_logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setLevel(level)
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        app_logger.addHandler(handler)
+    else:
+        for handler in app_logger.handlers:
+            handler.setLevel(level)
+            if isinstance(handler, logging.StreamHandler):
+                handler.stream = sys.stderr
+
+    _logging_configured = True
+    return app_logger
+
+
+def format_tool_error(prefix: str, exc: Exception) -> str:
+    """Format a human-readable MCP tool error without leaking payload contents."""
+    if isinstance(exc, NukeCommandError):
+        return f"{prefix}: {exc.error_type}: {exc.message}"
+    return f"{prefix}: {exc}"
+
+
+def _timeout_category(command_type: str, timeout: float) -> str:
+    if command_type == "render" or timeout == RENDER_TIMEOUT_SECONDS:
+        return "render"
+    if timeout == CONNECT_TIMEOUT_SECONDS:
+        return "connect"
+    return "command"
+
+
+logger = configure_logging()
 
 # Workflow Rules for Nuke Compositing - with stability focus
 class NukeWorkflowRules:
@@ -297,34 +368,40 @@ class NukeConnection:
     host: str
     port: int
     sock: socket.socket = None
-    
-    def connect(self) -> bool:
-        """Connect to the Nuke addon socket server"""
-        # Always close any existing connection first
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    _receive_buffer: bytes = field(default=b"", repr=False)
+
+    def _invalidate(self):
         if self.sock:
             try:
                 self.sock.close()
-            except:
+            except OSError:
+                pass
+        self.sock = None
+        self._receive_buffer = b""
+
+    def connect(self) -> bool:
+        """Connect to the Nuke addon socket server"""
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
                 pass
             self.sock = None
-            
+
         try:
             logger.debug(f"Attempting to connect to Nuke at {self.host}:{self.port}")
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(5)  # Set a timeout for the connection attempt
+            self.sock.settimeout(CONNECT_TIMEOUT_SECONDS)
             self.sock.connect((self.host, self.port))
+            self._receive_buffer = b""
             logger.info(f"Successfully connected to Nuke at {self.host}:{self.port}")
             return True
         except Exception as e:
             logger.error(f"Failed to connect to Nuke: {str(e)}")
-            if self.sock:
-                try:
-                    self.sock.close()
-                except:
-                    pass
-                self.sock = None
+            self._invalidate()
             return False
-    
+
     def disconnect(self):
         """Disconnect from the Nuke addon"""
         if self.sock:
@@ -335,176 +412,217 @@ class NukeConnection:
                 logger.error(f"Error disconnecting from Nuke: {str(e)}")
             finally:
                 self.sock = None
+                self._receive_buffer = b""
                 logger.info("Disconnected from Nuke")
 
-    def receive_full_response(self, sock, buffer_size=8192):
-        """Receive the complete response, potentially in multiple chunks"""
-        chunks = []
-        # Set a timeout for receiving response
-        sock.settimeout(15.0)
-        
-        try:
-            logger.debug("Waiting to receive data from Nuke...")
-            while True:
-                try:
-                    chunk = sock.recv(buffer_size)
-                    if not chunk:
-                        # If we get an empty chunk, the connection might be closed
-                        if not chunks:  # If we haven't received anything yet, this is an error
-                            raise Exception("Connection closed before receiving any data")
-                        break
-                    
-                    logger.debug(f"Received chunk of {len(chunk)} bytes")
-                    chunks.append(chunk)
-                    
-                    # Check if we've received a complete JSON object
-                    try:
-                        data = b''.join(chunks)
-                        json.loads(data.decode('utf-8'))
-                        # If we get here, it parsed successfully
-                        logger.info(f"Received complete response ({len(data)} bytes)")
-                        return data
-                    except json.JSONDecodeError:
-                        # Incomplete JSON, continue receiving
-                        logger.debug("Incomplete JSON, continuing to receive...")
-                        continue
-                except socket.timeout:
-                    # If we hit a timeout during receiving, break the loop and try to use what we have
-                    logger.warning("Socket timeout during chunked receive")
-                    break
-                except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-                    logger.error(f"Socket connection error during receive: {str(e)}")
-                    raise  # Re-raise to be handled by the caller
-        except socket.timeout:
-            logger.warning("Socket timeout during chunked receive")
-        except Exception as e:
-            logger.error(f"Error during receive: {str(e)}")
-            raise
-            
-        # If we get here, we either timed out or broke out of the loop
-        # Try to use what we have
-        if chunks:
-            data = b''.join(chunks)
-            logger.info(f"Returning data after receive completion ({len(data)} bytes)")
-            try:
-                # Try to parse what we have
-                json.loads(data.decode('utf-8'))
-                return data
-            except json.JSONDecodeError:
-                # If we can't parse it, it's incomplete
-                raise Exception("Incomplete JSON response received")
-        else:
-            raise Exception("No data received")
+    def _receive_line(self):
+        while b"\n" not in self._receive_buffer:
+            chunk = self.sock.recv(8192)
+            if not chunk:
+                raise ConnectionError("Nuke closed the connection")
+            self._receive_buffer += chunk
+            if len(self._receive_buffer) > MAX_MESSAGE_BYTES:
+                raise ProtocolError("Nuke response exceeds maximum size")
+        line, self._receive_buffer = self._receive_buffer.split(b"\n", 1)
+        return line
 
-    def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Send a command to Nuke and return the response"""
-        if not self.sock and not self.connect():
-            raise ConnectionError("Not connected to Nuke")
-        
-        command = {
-            "type": command_type,
-            "params": params or {}
-        }
-        
+    def _parse_response(self, line: bytes, request_id: str) -> Dict[str, Any]:
         try:
-            # Log the command being sent
-            logger.info(f"Sending command: {command_type} with params: {params}")
-            
-            # Send the command
-            command_json = json.dumps(command)
-            logger.debug(f"Raw command JSON: {command_json}")
-            self.sock.sendall(command_json.encode('utf-8'))
-            logger.info(f"Command sent, waiting for response...")
-            
-            # Set a timeout for receiving
-            self.sock.settimeout(15.0)
-            
-            # Receive the response using the improved receive_full_response method
-            response_data = self.receive_full_response(self.sock)
-            logger.info(f"Received {len(response_data)} bytes of data")
-            
-            response = json.loads(response_data.decode('utf-8'))
-            logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
-            
-            if response.get("status") == "error":
-                logger.error(f"Nuke error: {response.get('message')}")
-                raise Exception(response.get("message", "Unknown error from Nuke"))
-            
+            text = line.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProtocolError(f"Invalid UTF-8 in Nuke response: {exc}") from exc
+
+        try:
+            response = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ProtocolError(f"Invalid JSON in Nuke response: {exc}") from exc
+
+        if not isinstance(response, dict):
+            raise ProtocolError("Nuke response must be a JSON object")
+
+        if response.get("id") != request_id:
+            raise ProtocolError(
+                f"Response ID mismatch: expected {request_id}, got {response.get('id')}"
+            )
+
+        status = response.get("status")
+        if status == "success":
             return response.get("result", {})
-        except socket.timeout:
-            logger.error("Socket timeout while waiting for response from Nuke")
-            # Invalidate the current socket so it will be recreated next time
-            self.sock = None
-            raise Exception("Timeout waiting for Nuke response - try simplifying your request")
-        except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-            logger.error(f"Socket connection error: {str(e)}")
-            self.sock = None
-            raise Exception(f"Connection to Nuke lost: {str(e)}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON response from Nuke: {str(e)}")
-            # Try to log what was received
-            if 'response_data' in locals() and response_data:
-                logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
-            raise Exception(f"Invalid response from Nuke: {str(e)}")
-        except Exception as e:
-            logger.error(f"Error communicating with Nuke: {str(e)}")
-            self.sock = None
-            raise Exception(f"Communication error with Nuke: {str(e)}")
+        if status == "error":
+            error = response.get("error") or {}
+            raise NukeCommandError(
+                error.get("type", "UnknownError"),
+                error.get("message", "Unknown error from Nuke"),
+            )
+
+        raise ProtocolError(f"Invalid response status: {status!r}")
+
+    def send_command(
+        self,
+        command_type: str,
+        params: Dict[str, Any] = None,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Send a command to Nuke and return the response"""
+        if timeout is None:
+            timeout = COMMAND_TIMEOUT_SECONDS
+
+        with self._lock:
+            if not self.sock and not self.connect():
+                raise ConnectionError("Not connected to Nuke")
+
+            request_id = str(uuid.uuid4())
+            command = {
+                "id": request_id,
+                "type": command_type,
+                "params": params or {},
+            }
+            timeout_category = _timeout_category(command_type, timeout)
+            start_time = time.monotonic()
+
+            try:
+                logger.info(
+                    "Sending command: %s (id=%s, timeout_category=%s, timeout=%ss)",
+                    command_type,
+                    request_id,
+                    timeout_category,
+                    timeout,
+                )
+                self.sock.settimeout(timeout)
+                payload = (
+                    json.dumps(command, separators=(",", ":"), ensure_ascii=False)
+                    + "\n"
+                )
+                self.sock.sendall(payload.encode("utf-8"))
+
+                line = self._receive_line()
+                result = self._parse_response(line, request_id)
+                elapsed = time.monotonic() - start_time
+                logger.info(
+                    "Command completed: %s (id=%s, elapsed=%.3fs)",
+                    command_type,
+                    request_id,
+                    elapsed,
+                )
+                return result
+            except NukeCommandError as exc:
+                elapsed = time.monotonic() - start_time
+                logger.error(
+                    "Command failed: %s (id=%s, elapsed=%.3fs, exception=%s)",
+                    command_type,
+                    request_id,
+                    elapsed,
+                    exc.__class__.__name__,
+                )
+                raise
+            except (socket.timeout, TimeoutError) as exc:
+                elapsed = time.monotonic() - start_time
+                logger.error(
+                    "Command timeout: %s (id=%s, elapsed=%.3fs, exception=%s)",
+                    command_type,
+                    request_id,
+                    elapsed,
+                    exc.__class__.__name__,
+                )
+                self._invalidate()
+                raise TimeoutError(
+                    "Timeout waiting for Nuke response - try simplifying your request"
+                ) from exc
+            except (ConnectionError, BrokenPipeError, ConnectionResetError, OSError) as exc:
+                elapsed = time.monotonic() - start_time
+                logger.error(
+                    "Command connection error: %s (id=%s, elapsed=%.3fs, exception=%s)",
+                    command_type,
+                    request_id,
+                    elapsed,
+                    exc.__class__.__name__,
+                )
+                self._invalidate()
+                raise ConnectionError(f"Connection to Nuke lost: {exc}") from exc
+            except ProtocolError as exc:
+                elapsed = time.monotonic() - start_time
+                logger.error(
+                    "Command protocol error: %s (id=%s, elapsed=%.3fs, exception=%s)",
+                    command_type,
+                    request_id,
+                    elapsed,
+                    exc.__class__.__name__,
+                )
+                self._invalidate()
+                raise
+            except Exception as exc:
+                elapsed = time.monotonic() - start_time
+                logger.error(
+                    "Command error: %s (id=%s, elapsed=%.3fs, exception=%s)",
+                    command_type,
+                    request_id,
+                    elapsed,
+                    exc.__class__.__name__,
+                )
+                self._invalidate()
+                raise
+
+    def ping(self) -> bool:
+        """Check transport health without touching the Nuke script."""
+        try:
+            result = self.send_command("ping")
+        except Exception:
+            return False
+        return result == {"pong": True}
 
 # Global connection for resources
 _nuke_connection = None
+# Serializes the whole acquire/validate/create sequence so parallel FastMCP
+# worker calls share one TCP connection instead of racing to create their own.
+_nuke_connection_lock = threading.RLock()
 
 def get_nuke_connection():
     """Get or create a persistent Nuke connection"""
     global _nuke_connection
-    
-    # If we have an existing connection, check if it's still valid
-    if _nuke_connection is not None:
-        try:
-            # Try a simple ping command to check if the connection is still valid
-            logger.debug("Testing existing connection with a ping")
-            _nuke_connection.send_command("get_script_info")
-            logger.debug("Existing connection is valid")
-            return _nuke_connection
-        except Exception as e:
-            # Connection is dead, close it and create a new one
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
+
+    with _nuke_connection_lock:
+        # If we have an existing connection, check if it's still valid
+        if _nuke_connection is not None:
+            logger.debug("Testing existing connection with ping")
+            if _nuke_connection.ping():
+                logger.debug("Existing connection is valid")
+                return _nuke_connection
+
+            logger.warning("Existing connection is no longer valid; reconnecting")
             try:
                 _nuke_connection.disconnect()
-            except:
+            except Exception:
                 pass
             _nuke_connection = None
-    
-    # Create a new connection
-    logger.info("Creating new connection to Nuke")
-    _nuke_connection = NukeConnection(host="localhost", port=9876)
-    
-    # Try connecting multiple times with a delay
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
-        logger.info(f"Connection attempt {attempt}/{max_attempts}")
-        if _nuke_connection.connect():
-            logger.info("Successfully connected to Nuke")
-            
-            # Verify connection with a simple command
-            try:
-                logger.debug("Verifying connection with a test command")
-                _nuke_connection.send_command("get_script_info")
-                logger.info("Connection verified - Nuke is responding to commands")
-                return _nuke_connection
-            except Exception as e:
-                logger.error(f"Connection verification failed: {str(e)}")
+
+        # Create a new connection
+        logger.info(f"Creating new connection to Nuke at {NUKE_HOST}:{NUKE_PORT}")
+        _nuke_connection = NukeConnection(host=NUKE_HOST, port=NUKE_PORT)
+
+        # Try connecting multiple times with a delay
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            logger.info(f"Connection attempt {attempt}/{max_attempts}")
+            if _nuke_connection.connect():
+                logger.info("Successfully connected to Nuke")
+
+                logger.debug("Verifying connection with ping")
+                if _nuke_connection.ping():
+                    logger.info("Connection verified - Nuke is responding to ping")
+                    return _nuke_connection
+
+                logger.error("Connection verification failed: ping did not succeed")
                 _nuke_connection.disconnect()
-        
-        if attempt < max_attempts:
-            delay = 2 * attempt  # Increasing delay between attempts
-            logger.info(f"Waiting {delay} seconds before next attempt")
-            time.sleep(delay)
-    
-    # If we get here, all connection attempts failed
-    logger.error("Failed to connect to Nuke after multiple attempts")
-    _nuke_connection = None
-    raise Exception("Could not connect to Nuke. Make sure the Nuke addon is running.")
+
+            if attempt < max_attempts:
+                delay = 2 * attempt  # Increasing delay between attempts
+                logger.info(f"Waiting {delay} seconds before next attempt")
+                time.sleep(delay)
+
+        # If we get here, all connection attempts failed
+        logger.error("Failed to connect to Nuke after multiple attempts")
+        _nuke_connection = None
+        raise Exception("Could not connect to Nuke. Make sure the Nuke addon is running.")
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
@@ -569,8 +687,8 @@ def get_script_info(ctx: Context) -> str:
         
         return output
     except Exception as e:
-        logger.error(f"Error in get_script_info: {str(e)}")
-        return f"Error getting script info: {str(e)}"
+        logger.error("Error in get_script_info: %s", e.__class__.__name__)
+        return format_tool_error("Error getting script info", e)
 
 @mcp.tool()
 def get_node_info(ctx: Context, node_name: str) -> str:
@@ -627,8 +745,8 @@ def get_node_info(ctx: Context, node_name: str) -> str:
         
         return output
     except Exception as e:
-        logger.error(f"Error in get_node_info: {str(e)}")
-        return f"Error getting node info: {str(e)}"
+        logger.error("Error in get_node_info: %s", e.__class__.__name__)
+        return format_tool_error("Error getting node info", e)
 
 @mcp.tool()
 def create_node(
@@ -732,8 +850,8 @@ output = {
             
         return message
     except Exception as e:
-        logger.error(f"Error in create_node: {str(e)}")
-        return f"Error creating node: {str(e)}"
+        logger.error("Error in create_node: %s", e.__class__.__name__)
+        return format_tool_error("Error creating node", e)
 
 @mcp.tool()
 def modify_node(
@@ -838,8 +956,8 @@ def modify_node(
             
         return message
     except Exception as e:
-        logger.error(f"Error in modify_node: {str(e)}")
-        return f"Error modifying node: {str(e)}"
+        logger.error("Error in modify_node: %s", e.__class__.__name__)
+        return format_tool_error("Error modifying node", e)
 
 @mcp.tool()
 def delete_node(ctx: Context, name: str) -> str:
@@ -858,8 +976,8 @@ def delete_node(ctx: Context, name: str) -> str:
         node_type = result.get("type", "unknown")
         return f"Deleted {node_type} node '{deleted_name}'"
     except Exception as e:
-        logger.error(f"Error in delete_node: {str(e)}")
-        return f"Error deleting node: {str(e)}"
+        logger.error("Error in delete_node: %s", e.__class__.__name__)
+        return format_tool_error("Error deleting node", e)
 
 @mcp.tool()
 def position_node(ctx: Context, name: str, x: int, y: int) -> str:
@@ -893,8 +1011,8 @@ def position_node(ctx: Context, name: str, x: int, y: int) -> str:
             
         return message
     except Exception as e:
-        logger.error(f"Error in position_node: {str(e)}")
-        return f"Error positioning node: {str(e)}"
+        logger.error("Error in position_node: %s", e.__class__.__name__)
+        return format_tool_error("Error positioning node", e)
 
 @mcp.tool()
 def connect_nodes(
@@ -949,8 +1067,8 @@ def connect_nodes(
             
         return message
     except Exception as e:
-        logger.error(f"Error in connect_nodes: {str(e)}")
-        return f"Error connecting nodes: {str(e)}"
+        logger.error("Error in connect_nodes: %s", e.__class__.__name__)
+        return format_tool_error("Error connecting nodes", e)
 
 @mcp.tool()
 def render(
@@ -970,17 +1088,21 @@ def render(
     try:
         logger.info(f"Tool called: render with range {frame_range}, write_node: {write_node}")
         nuke = get_nuke_connection()
-        result = nuke.send_command("render", {
-            "frame_range": frame_range,
-            "write_node": write_node,
-            "proxy_mode": proxy_mode
-        })
+        result = nuke.send_command(
+            "render",
+            {
+                "frame_range": frame_range,
+                "write_node": write_node,
+                "proxy_mode": proxy_mode,
+            },
+            timeout=RENDER_TIMEOUT_SECONDS,
+        )
         
         status = result.get("status", "Rendering completed")
         return f"{status}"
     except Exception as e:
-        logger.error(f"Error in render: {str(e)}")
-        return f"Error initiating render: {str(e)}"
+        logger.error("Error in render: %s", e.__class__.__name__)
+        return format_tool_error("Error initiating render", e)
 
 @mcp.tool()
 def viewer_playback(
@@ -1009,14 +1131,18 @@ def viewer_playback(
         status = result.get("status", "Viewer operation completed")
         return status
     except Exception as e:
-        logger.error(f"Error in viewer_playback: {str(e)}")
-        return f"Error controlling viewer: {str(e)}"
+        logger.error("Error in viewer_playback: %s", e.__class__.__name__)
+        return format_tool_error("Error controlling viewer", e)
 
 @mcp.tool()
 def execute_nuke_code(ctx: Context, code: str) -> str:
     """
     Execute arbitrary Python code in Nuke.
-    
+
+    Advanced, high-risk operation: runs arbitrary Python in the Nuke process
+    with the same privileges as the host application. Prefer structured MCP tools
+    when possible.
+
     Parameters:
     - code: The Python code to execute
     """
@@ -1051,8 +1177,8 @@ def execute_nuke_code(ctx: Context, code: str) -> str:
             error = result.get("error", "Unknown error")
             return f"Code execution failed: {error}"
     except Exception as e:
-        logger.error(f"Error in execute_nuke_code: {str(e)}")
-        return f"Error executing code: {str(e)}"
+        logger.error("Error in execute_nuke_code: %s", e.__class__.__name__)
+        return format_tool_error("Error executing code", e)
 
 @mcp.tool()
 def auto_layout_nodes(ctx: Context, selected_only: bool = False) -> str:
@@ -1110,8 +1236,8 @@ output = {{"status": result}}
             error = result.get("error", "Unknown error")
             return f"Failed to auto-layout nodes: {error}"
     except Exception as e:
-        logger.error(f"Error in auto_layout_nodes: {str(e)}")
-        return f"Error arranging nodes: {str(e)}"
+        logger.error("Error in auto_layout_nodes: %s", e.__class__.__name__)
+        return format_tool_error("Error arranging nodes", e)
 
 @mcp.tool()
 def set_frames(
@@ -1139,8 +1265,8 @@ def set_frames(
         
         return f"Updated frame settings - First: {result['first_frame']}, Last: {result['last_frame']}, Current: {result['current_frame']}"
     except Exception as e:
-        logger.error(f"Error in set_frames: {str(e)}")
-        return f"Error setting frames: {str(e)}"
+        logger.error("Error in set_frames: %s", e.__class__.__name__)
+        return format_tool_error("Error setting frames", e)
 
 @mcp.tool()
 def create_viewer(ctx: Context, input_node: str = None) -> str:
@@ -1163,8 +1289,8 @@ def create_viewer(ctx: Context, input_node: str = None) -> str:
         else:
             return f"Created Viewer node '{viewer_name}'"
     except Exception as e:
-        logger.error(f"Error in create_viewer: {str(e)}")
-        return f"Error creating viewer: {str(e)}"
+        logger.error("Error in create_viewer: %s", e.__class__.__name__)
+        return format_tool_error("Error creating viewer", e)
 
 @mcp.tool()
 def create_workflow_template(
@@ -1347,8 +1473,8 @@ except Exception as e:
             return f"Failed to create workflow template: {error}"
     
     except Exception as e:
-        logger.error(f"Error in create_workflow_template: {str(e)}")
-        return f"Error creating workflow template: {str(e)}"
+        logger.error("Error in create_workflow_template: %s", e.__class__.__name__)
+        return format_tool_error("Error creating workflow template", e)
 
 @mcp.tool()
 def organize_node_graph(
@@ -1536,8 +1662,8 @@ except Exception as e:
             error = result.get("error", "Unknown error")
             return f"Failed to organize nodes: {error}"
     except Exception as e:
-        logger.error(f"Error in organize_node_graph: {str(e)}")
-        return f"Error organizing node graph: {str(e)}"
+        logger.error("Error in organize_node_graph: %s", e.__class__.__name__)
+        return format_tool_error("Error organizing node graph", e)
 
 @mcp.prompt()
 def nuke_mcp_usage() -> str:

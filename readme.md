@@ -23,7 +23,7 @@ Nuke-MCP allows AI assistants to interact with Nuke through a socket connection,
 
 ### Prerequisites
 
-- The Foundry's Nuke (any recent version should work)
+- The Foundry's Nuke (any recent version should work), run **interactively with its GUI** — headless `nuke -t` / `nuke -x` is not supported (see [Requires an interactive GUI Nuke session](#requires-an-interactive-gui-nuke-session))
 - Python 3.7+
 - FastMCP package
 - Claude Desktop
@@ -48,62 +48,83 @@ pip install fastmcp
      - Copy it to your Nuke scripts folder (usually in `~/.nuke/python` on Linux/Mac or in your home directory on Windows)
      - Or place it in a folder that's in your Nuke Python path
 
-2. **Create a Startup Script** (Recommended):
-   - Create or edit an existing `init.py` file in your `.nuke` directory
-   - Add the following line to automatically load the addon when Nuke starts and making sure you're pointing to the python subfolder where the MCP tools live:
+2. **Put the folder on Nuke's Python path** — in `~/.nuke/init.py`:
      ```python
      nuke.pluginAddPath("./python")
-     
-     import nuke_mcp_addon
      ```
 
-3. **Manual Loading** (Alternative):
-   - If you don't want to load it automatically, you can manually load it each time by:
-     - Opening Nuke
-     - Make sure you have a python subfolder setup in the init.py where the MCP tools live
-     - Going to the Script Editor panel
-     - Running `import nuke_mcp_addon`
+3. **Register the panel from `menu.py`, not `init.py`** (Recommended):
+
+   Import the addon from `~/.nuke/menu.py`. `init.py` runs before Nuke's UI
+   exists, so `nukescripts.PythonPanel` is not yet available there. The addon
+   itself imports `nukescripts` lazily and is safe to import at either time,
+   but the menu commands need a UI to attach to.
+
+     ```python
+     import nuke_mcp_addon
+
+     nuke.menu("Nuke").addCommand("NukeMCP/Show Panel", "nuke_mcp_addon.show_panel()")
+     nuke.toolbar("Nodes").addCommand("NukeMCP/NukeMCP Panel", "nuke_mcp_addon.show_panel()")
+     ```
+
+4. **Auto-start the socket server** (Optional):
+
+   To let an MCP client connect to a freshly launched Nuke without an operator
+   opening the panel first, add this to `menu.py`. The port must match the
+   `NUKE_MCP_PORT` given to the MCP server process:
+
+     ```python
+     try:
+         nuke_mcp_addon.ensure_server_running(port=9876)
+     except Exception as exc:
+         print(f"[NukeMCP] auto-start failed: {exc}")
+     ```
+
+   `ensure_server_running()` is idempotent — calling it when the server is
+   already listening returns the existing instance rather than rebinding.
+
+5. **Manual Loading** (Alternative):
+   - Open Nuke, go to the Script Editor panel, and run `import nuke_mcp_addon`,
+     then `nuke_mcp_addon.show_panel()`.
 
 ### Docking the NukeMCP Panel
 
-By default, the NukeMCP panel opens as a floating window. If you prefer to have it docked in Nuke's interface, you can modify the `NukeMCPPanel` class in `nuke_mcp_addon.py`:
+By default, the NukeMCP panel opens as a floating window. If you prefer it
+docked, add an `addToPane` method to the panel class built inside
+`_make_panel_class()` in `nuke_mcp_addon.py`:
 
 ```python
-# Find the NukeMCPPanel class definition (around line 380)
-class NukeMCPPanel(nukescripts.PythonPanel):
-    def __init__(self):
-        nukescripts.PythonPanel.__init__(self, 'Nuke MCP', 'com.example.NukeMCP')
+def _make_panel_class():
+    PythonPanel = _python_panel_base()
+
+    class NukeMCPPanel(PythonPanel):
         # ... existing code ...
 
-# Add this method to enable docking
-    def addToPane(self):
-        pane = nuke.getPaneFor('Properties.1')
-        if not pane:
-            pane = nuke.getPaneFor('Viewer.1')
-        self.setMinimumSize(300, 200)  # Set a reasonable minimum size
-        return pane.addPermanentAsQWidget(self)
+        def addToPane(self):
+            pane = nuke.getPaneFor('Properties.1')
+            if not pane:
+                pane = nuke.getPaneFor('Viewer.1')
+            self.setMinimumSize(300, 200)
+            return pane.addPermanentAsQWidget(self)
 
-# Modify the show_panel function to use docking
+    return NukeMCPPanel
+```
+
+Then have `show_panel()` dock it instead of floating:
+
+```python
 def show_panel():
-    """Show the NukeMCP panel"""
     global _panel
     if _panel is None:
-        _panel = NukeMCPPanel()
-    
-    # Show as docked panel instead of floating window
+        _panel = _make_panel_class()()
+
     pane = _panel.addToPane()
     if pane:
         _panel.setParent(pane)
 ```
 
-You can also modify how the panel appears in the menu. Based on your menu.py file, you have:
-
-```python
-# MCP Tools
-nuke.toolbar("Nodes").addCommand('NukeMCP/NukeMCP Panel', 'nuke_mcp_addon.show_panel()')
-```
-
-To ensure it's properly integrated with your existing toolbar structure, make sure this line is uncommented in your menu.py file.
+The panel class is constructed on first use rather than at import time, so that
+importing the addon never requires Nuke's UI to be up yet.
 
 ## Troubleshooting
 
@@ -370,6 +391,82 @@ If Claude cannot connect to Nuke, check the following:
 - **"Could not connect to Nuke"**: Make sure the Nuke addon is running and using the correct port
 - **"Socket timeout while waiting for response"**: The operation in Nuke may be taking too long
 - **"Failed to create node"**: Check if the node type name is correct
+
+## Stability and Operations
+
+### Keep addon and MCP server in sync
+
+The wire protocol between the MCP server and the Nuke addon is **newline-framed JSON** (one request or response per line). Always update **`nuke_mcp_addon.py` and the MCP server (`nuke_mcp_server.py` / `main.py`) together** when upgrading. Mixing versions can cause framing or protocol mismatches.
+
+### Requires an interactive GUI Nuke session
+
+This addon **only works inside an interactive GUI Nuke session**. Nuke API work is marshalled to Nuke's main thread via `executeInMainThreadWithResult`, which only drains when Nuke's GUI event loop is running.
+
+**Headless Nuke (`nuke -t`, `nuke -x`) is not supported by this addon architecture.** In a headless interpreter there is no event loop to run the queued main-thread work, so commands never complete and every request eventually times out. Run Nuke normally (with its interface) and start the NukeMCP panel there.
+
+### Threading and health checks
+
+Nuke API work is **marshalled to Nuke's main thread** via `executeInMainThreadWithResult`, and the handler outcome (success value or failure) is captured explicitly rather than relying on the dispatcher to propagate exceptions. Lightweight **`ping`** commands are used for connection health checks instead of heavier script queries.
+
+### One command at a time
+
+The addon accepts **a single client connection and processes one command at a time**. This has direct operational consequences:
+
+- **A render blocks every other MCP operation.** While `render` is running on Nuke's main thread, no other tool call — not even `ping` — can be serviced. Expect the MCP client to appear stalled for the duration of the render.
+- **Long operations look like timeouts.** The MCP-side timeout only bounds how long the client waits; it does not cancel the work inside Nuke.
+- **A timed-out mutation may already have applied.** If a mutating command (`create_node`, `modify_node`, `delete_node`, `execute_nuke_code`, `render`, …) times out, the operation may have completed in Nuke anyway. The MCP server therefore **never automatically retries a command once bytes have been sent**. Re-issue such a command only after inspecting the script state with `get_script_info` / `get_node_info`, otherwise you risk duplicate nodes or a duplicated render.
+
+### Logging
+
+All MCP-process logs go to **stderr** so stdout stays clean for the MCP stdio transport. Set verbosity with:
+
+```text
+NUKE_MCP_LOG_LEVEL=INFO
+```
+
+### Endpoint and timeouts
+
+Override defaults via environment variables:
+
+```text
+NUKE_MCP_HOST=localhost
+NUKE_MCP_PORT=9876
+NUKE_MCP_CONNECT_TIMEOUT=5
+NUKE_MCP_COMMAND_TIMEOUT=30
+NUKE_MCP_RENDER_TIMEOUT=3600
+NUKE_MCP_LOG_LEVEL=INFO
+```
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `NUKE_MCP_HOST` | localhost | Addon socket host |
+| `NUKE_MCP_PORT` | 9876 | Addon socket port |
+| `NUKE_MCP_CONNECT_TIMEOUT` | 5 | Socket connect to the addon |
+| `NUKE_MCP_COMMAND_TIMEOUT` | 30 | Most MCP tool commands |
+| `NUKE_MCP_RENDER_TIMEOUT` | 3600 | `render` tool |
+| `NUKE_MCP_LOG_LEVEL` | INFO | MCP server log level |
+
+**Both processes read `NUKE_MCP_HOST` / `NUKE_MCP_PORT`.** The addon uses them
+for its listening socket default and the MCP server uses them for its connect
+target, so a non-default port stays consistent as long as both processes see the
+same environment. If Nuke is launched from a different environment than the MCP
+server (common — the MCP client spawns the server), pass the port explicitly in
+`menu.py` via `ensure_server_running(port=...)` and set `NUKE_MCP_PORT` in the
+MCP client config so the two agree.
+
+### Manual Nuke smoke test
+
+Run after installing or upgrading:
+
+1. Replace/reload the addon and start the NukeMCP panel (confirm it is listening on port **9876**).
+2. Start the MCP server and query script info (`get_script_info`).
+3. Create and modify one **Grade** node.
+4. Disconnect or restart the MCP client, then query script info again.
+5. Render a short frame range from a valid **Write** node.
+
+### Advanced tools
+
+`execute_nuke_code` runs arbitrary Python inside Nuke. Treat it as **advanced and high risk** — prefer the typed MCP tools for routine work, and use `execute_nuke_code` only when no dedicated tool exists.
 
 ## Development
 

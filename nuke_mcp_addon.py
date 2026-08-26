@@ -1,180 +1,403 @@
 import nuke
-import nukescripts
 import json
 import threading
 import socket
 import time
 import traceback
 import os
+import re
 from typing import Dict, Any, List, Optional, Union
 
+# nukescripts is imported lazily. Importing it at module scope fails while
+# init.py runs, because PythonPanel is not registered until Nuke's UI is up.
+
+# Must match NUKE_MCP_HOST/NUKE_MCP_PORT used by the MCP server process.
+DEFAULT_HOST = os.getenv("NUKE_MCP_HOST", "localhost")
+DEFAULT_PORT = int(os.getenv("NUKE_MCP_PORT", "9876"))
+
+MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+SOCKET_POLL_TIMEOUT = 0.1
+# Sending a response must not inherit the short read-poll timeout, otherwise
+# sendall can be interrupted mid-frame and truncate the newline-framed reply.
+RESPONSE_SEND_TIMEOUT = 30.0
+
+_OUTCOME_MARKER = "__nuke_mcp_outcome__"
+
+
+class MainThreadDispatchError(Exception):
+    """Raised when main-thread dispatch produced no usable handler outcome."""
+
+
+class MainThreadHandlerError(Exception):
+    """Carries a handler failure captured on Nuke's main thread."""
+
+    def __init__(self, error_type, message):
+        self.error_type = error_type
+        self.error_message = message
+        super().__init__("%s: %s" % (error_type, message))
+
+
+def encode_message(payload):
+    return (
+        json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+
+
 class NukeMCPServer:
-    def __init__(self, host='localhost', port=9876):
+    def __init__(self, host=None, port=None):
+        host = DEFAULT_HOST if host is None else host
+        port = DEFAULT_PORT if port is None else int(port)
         self.host = host
         self.port = port
         self.running = False
         self.socket = None
         self.client = None
-        self.buffer = b''  # Buffer for incomplete data
-        
+        self.buffer = b''
+        self.server_thread = None
+
         # Cache for valid node types
         self._valid_node_types = None
-    
+
     def start(self):
         """Start the socket server"""
+        if self.running:
+            return True
+
         self.running = True
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
+
         try:
             self.socket.bind((self.host, self.port))
             self.socket.listen(1)
-            self.socket.setblocking(False)
-            
-            # Start the server loop in a separate thread
+            self.socket.settimeout(SOCKET_POLL_TIMEOUT)
+
             self.server_thread = threading.Thread(target=self._server_loop)
             self.server_thread.daemon = True
             self.server_thread.start()
-            
+
             print(f"NukeMCP server started on {self.host}:{self.port}")
             return True
         except Exception as e:
             print(f"Failed to start server: {str(e)}")
             self.stop()
             return False
-            
+
     def stop(self):
         """Stop the socket server"""
         self.running = False
-        if self.socket:
-            self.socket.close()
         if self.client:
-            self.client.close()
-        self.socket = None
-        self.client = None
+            try:
+                self.client.close()
+            except Exception:
+                pass
+            self.client = None
+        if self.socket:
+            try:
+                self.socket.close()
+            except Exception:
+                pass
+            self.socket = None
+        self.buffer = b''
+
+        if self.server_thread is not None:
+            if threading.current_thread() is not self.server_thread:
+                self.server_thread.join(timeout=1.0)
+            self.server_thread = None
+
         print("NukeMCP server stopped")
+
+    def _report_loop_error(self, context, exc):
+        """Report a loop socket error, unless stop() caused it.
+
+        Returns True when the error was reported. After ``stop()`` clears
+        ``running`` it also closes the sockets, so accept/recv failures are
+        the expected consequence of shutdown rather than a real fault.
+        """
+        if not self.running:
+            return False
+        print(f"Error {context}: {str(exc)}")
+        return True
+
+    def _reset_client(self, client=None):
+        """Close a client session and discard its partial buffer."""
+        target = client if client is not None else self.client
+        if target is not None:
+            try:
+                target.close()
+            except Exception:
+                pass
+        if client is None or self.client is client:
+            self.client = None
+        self.buffer = b''
+
+    def _send_responses(self, client, responses):
+        """Send framed responses; a failed send ends the client session."""
+        try:
+            client.settimeout(RESPONSE_SEND_TIMEOUT)
+            for response in responses:
+                client.sendall(response)
+            client.settimeout(SOCKET_POLL_TIMEOUT)
+            return True
+        except Exception as e:
+            print(f"Error sending response, closing client session: {str(e)}")
+            self._reset_client(client)
+            return False
 
     def _server_loop(self):
         """Main server loop that runs in a separate thread"""
         while self.running:
             try:
-                # Accept new connections
-                if not self.client and self.socket:
+                listen_sock = self.socket
+                if listen_sock is None and self.client is None:
+                    time.sleep(SOCKET_POLL_TIMEOUT)
+                    continue
+
+                if self.client is None and listen_sock is not None:
                     try:
-                        self.client, address = self.socket.accept()
-                        self.client.setblocking(False)
-                        print(f"Connected to client: {address}")
-                    except BlockingIOError:
-                        pass  # No connection waiting
-                    except Exception as e:
-                        print(f"Error accepting connection: {str(e)}")
-                
-                # Process existing connection
-                if self.client:
-                    try:
-                        # Try to receive data
-                        try:
-                            data = self.client.recv(8192)
-                            if data:
-                                self.buffer += data
-                                # Try to process complete messages
-                                try:
-                                    # Improved JSON check - count braces to verify completeness
-                                    buffer_str = self.buffer.decode('utf-8', errors='replace')
-                                    
-                                    # Simple check for JSON completeness
-                                    if buffer_str.count('{') == buffer_str.count('}') and buffer_str.strip().startswith('{'):
-                                        try:
-                                            # Attempt to parse the buffer as JSON
-                                            command = json.loads(buffer_str)
-                                            # If successful, clear the buffer and process command
-                                            self.buffer = b''
-                                            response = self.execute_command(command)
-                                            response_json = json.dumps(response)
-                                            self.client.sendall(response_json.encode('utf-8'))
-                                        except json.JSONDecodeError:
-                                            # Incomplete JSON, continue receiving
-                                            pass
-                                except Exception as e:
-                                    print(f"Error processing message: {str(e)}")
-                                    # Clear buffer on error to avoid getting stuck
-                                    self.buffer = b''
-                            else:
-                                # Connection closed by client
-                                print("Client disconnected")
-                                self.client.close()
-                                self.client = None
-                                self.buffer = b''
-                        except BlockingIOError:
-                            pass  # No data available
-                        except Exception as e:
-                            print(f"Error receiving data: {str(e)}")
-                            self.client.close()
-                            self.client = None
-                            self.buffer = b''
-                            
-                    except Exception as e:
-                        print(f"Error with client: {str(e)}")
-                        if self.client:
-                            self.client.close()
-                            self.client = None
+                        client, address = listen_sock.accept()
+                        client.settimeout(SOCKET_POLL_TIMEOUT)
+                        self.client = client
                         self.buffer = b''
-                        
+                        print(f"Connected to client: {address}")
+                    except socket.timeout:
+                        pass
+                    except Exception as e:
+                        self._report_loop_error("accepting connection", e)
+
+                client = self.client
+                if client is None:
+                    continue
+
+                try:
+                    data = client.recv(8192)
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    self._report_loop_error("receiving data", e)
+                    self._reset_client(client)
+                    continue
+
+                if not data:
+                    print("Client disconnected")
+                    self._reset_client(client)
+                    continue
+
+                try:
+                    responses = self._feed_data(data)
+                except Exception as e:
+                    print(f"Error processing request data: {str(e)}")
+                    traceback.print_exc()
+                    self._reset_client(client)
+                    continue
+
+                self._send_responses(client, responses)
+
             except Exception as e:
                 print(f"Server error: {str(e)}")
-            
-            # Sleep to prevent CPU hogging
-            time.sleep(0.1)
+
+    def _success_response(self, request_id, result):
+        return encode_message({
+            "id": request_id,
+            "status": "success",
+            "result": result,
+        })
+
+    def _error_response(self, request_id, error_type, message):
+        return encode_message({
+            "id": request_id,
+            "status": "error",
+            "error": {"type": error_type, "message": message},
+        })
+
+    def _extract_request_id(self, text):
+        match = re.search(r'"id"\s*:\s*"([^"]*)"', text)
+        if match:
+            return match.group(1)
+        return None
+
+    def _process_line(self, line):
+        """Process a single newline-delimited request line."""
+        request_id = None
+        if len(line) > MAX_MESSAGE_BYTES:
+            return self._error_response(
+                request_id,
+                "MessageTooLarge",
+                "Message exceeds maximum size",
+            )
+
+        try:
+            text = line.decode("utf-8")
+        except UnicodeDecodeError as e:
+            return self._error_response(
+                request_id,
+                "UnicodeDecodeError",
+                str(e),
+            )
+
+        try:
+            command = json.loads(text)
+        except json.JSONDecodeError as e:
+            request_id = self._extract_request_id(text)
+            return self._error_response(
+                request_id,
+                "JSONDecodeError",
+                str(e),
+            )
+
+        if not isinstance(command, dict):
+            return self._error_response(
+                None,
+                "InvalidRequest",
+                "Request must be a JSON object",
+            )
+
+        request_id = command.get("id")
+        envelope = self.execute_command(command)
+        return encode_message(envelope)
+
+    def _feed_data(self, data):
+        """Append socket data to the buffer and process complete lines."""
+        self.buffer += data
+        responses = []
+
+        if len(self.buffer) > MAX_MESSAGE_BYTES and b"\n" not in self.buffer:
+            responses.append(self._error_response(
+                None,
+                "MessageTooLarge",
+                "Unterminated message exceeds maximum size",
+            ))
+            self.buffer = b""
+            return responses
+
+        while b"\n" in self.buffer:
+            line, self.buffer = self.buffer.split(b"\n", 1)
+            responses.append(self._process_line(line))
+
+        if len(self.buffer) > MAX_MESSAGE_BYTES:
+            responses.append(self._error_response(
+                None,
+                "MessageTooLarge",
+                "Unterminated message exceeds maximum size",
+            ))
+            self.buffer = b""
+
+        return responses
+
+    def _run_in_nuke(self, handler, params):
+        """Run a handler on Nuke's main thread and recover its outcome.
+
+        The dispatcher is not trusted to propagate exceptions, so the handler
+        is wrapped in a guarded callable that returns a tagged outcome.
+        """
+        dispatcher = getattr(nuke, "executeInMainThreadWithResult", None)
+        if dispatcher is None:
+            return handler(**params)
+
+        def guarded_handler(**kwargs):
+            try:
+                return {
+                    _OUTCOME_MARKER: True,
+                    "ok": True,
+                    "value": handler(**kwargs),
+                }
+            except Exception as exc:
+                traceback.print_exc()
+                return {
+                    _OUTCOME_MARKER: True,
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
+
+        outcome = dispatcher(guarded_handler, kwargs=params)
+
+        if not isinstance(outcome, dict) or outcome.get(_OUTCOME_MARKER) is not True:
+            raise MainThreadDispatchError(
+                "Nuke main-thread dispatch returned no usable handler outcome; "
+                "the command result is unknown and may have partially applied"
+            )
+
+        if outcome.get("ok"):
+            return outcome.get("value")
+
+        raise MainThreadHandlerError(
+            outcome.get("error_type") or "HandlerError",
+            outcome.get("message") or "Handler failed on Nuke's main thread",
+        )
+
+    def ping(self, **kwargs):
+        return {"pong": True}
 
     def execute_command(self, command):
         """Execute a command received from the client"""
-        try:
-            cmd_type = command.get("type")
-            params = command.get("params", {})
-            
-            # Define handlers for different command types
-            handlers = {
-                "get_script_info": self.get_script_info,
-                "create_node": self.create_node,
-                "modify_node": self.modify_node,
-                "delete_node": self.delete_node,
-                "position_node": self.position_node,
-                "connect_nodes": self.connect_nodes,
-                "render": self.render,
-                "viewer_playback": self.viewer_playback,
-                "execute_code": self.execute_code,
-                "auto_layout": self.auto_layout,
-                "get_node_info": self.get_node_info,
-                "set_frames": self.set_frames,
-                "create_viewer": self.create_viewer
+        request_id = command.get("id")
+        cmd_type = command.get("type")
+        params = command.get("params", {})
+
+        handlers = {
+            "ping": self.ping,
+            "get_script_info": self.get_script_info,
+            "create_node": self.create_node,
+            "modify_node": self.modify_node,
+            "delete_node": self.delete_node,
+            "position_node": self.position_node,
+            "connect_nodes": self.connect_nodes,
+            "render": self.render,
+            "viewer_playback": self.viewer_playback,
+            "execute_code": self.execute_code,
+            "auto_layout": self.auto_layout,
+            "get_node_info": self.get_node_info,
+            "set_frames": self.set_frames,
+            "create_viewer": self.create_viewer,
+        }
+
+        handler = handlers.get(cmd_type)
+        if not handler:
+            return {
+                "id": request_id,
+                "status": "error",
+                "error": {
+                    "type": "UnknownCommand",
+                    "message": "Unknown command type: %s" % cmd_type,
+                },
             }
-            
-            handler = handlers.get(cmd_type)
-            if handler:
-                try:
-                    print(f"Executing handler for {cmd_type}")
-                    
-                    # Track execution time for debugging
-                    start_time = time.time()
-                    
-                    result = handler(**params)
-                    
-                    # Log execution time
-                    end_time = time.time()
-                    execution_time = end_time - start_time
-                    print(f"Handler execution complete in {execution_time:.2f} seconds")
-                    
-                    return {"status": "success", "result": result}
-                except Exception as e:
-                    print(f"Error in handler: {str(e)}")
-                    traceback.print_exc()
-                    return {"status": "error", "message": str(e)}
+
+        try:
+            print("Executing handler for %s" % cmd_type)
+            start_time = time.time()
+
+            if cmd_type == "ping":
+                result = handler(**params)
             else:
-                return {"status": "error", "message": f"Unknown command type: {cmd_type}"}
+                result = self._run_in_nuke(handler, params)
+
+            end_time = time.time()
+            execution_time = end_time - start_time
+            print("Handler execution complete in %.2f seconds" % execution_time)
+
+            return {
+                "id": request_id,
+                "status": "success",
+                "result": result,
+            }
         except Exception as e:
-            print(f"Error executing command: {str(e)}")
+            print("Error in handler: %s" % str(e))
             traceback.print_exc()
-            return {"status": "error", "message": str(e)}
+            if isinstance(e, MainThreadHandlerError):
+                error_type = e.error_type
+                error_message = e.error_message
+            else:
+                error_type = type(e).__name__
+                error_message = str(e)
+            return {
+                "id": request_id,
+                "status": "error",
+                "error": {
+                    "type": error_type,
+                    "message": error_message,
+                },
+            }
     
     def _get_valid_node_types(self):
         """Return a list of valid Nuke node types to prevent crashes."""
@@ -326,7 +549,7 @@ class NukeMCPServer:
         except Exception as e:
             print(f"Error in get_script_info: {str(e)}")
             traceback.print_exc()
-            return {"error": str(e)}
+            raise Exception(f"Failed to get script info: {str(e)}")
     
     def create_node(self, node_type, name=None, position=None, inputs=None, parameters=None):
         """Create a new node in Nuke with improved stability"""
@@ -708,6 +931,8 @@ class NukeMCPServer:
             output = {}
             
             # Create a local namespace for execution with safety
+            import nukescripts
+
             namespace = {"nuke": nuke, "nukescripts": nukescripts, "output": output}
             
             # Execute the code with safety wrapper
@@ -895,79 +1120,122 @@ output["status"] = result
             traceback.print_exc()
             raise Exception(f"Failed to create viewer: {str(e)}")
 
-class NukeMCPPanel(nukescripts.PythonPanel):
-    def __init__(self):
-        nukescripts.PythonPanel.__init__(self, 'Nuke MCP', 'com.example.NukeMCP')
-        
-        # Add port field
-        self.port = nuke.Int_Knob('port', 'Port:')
-        self.port.setValue(9876)
-        self.addKnob(self.port)
-        
-        # Add status field
-        self.status = nuke.Text_Knob('status', 'Status:')
-        self.status.setValue('Not connected')
-        self.addKnob(self.status)
-        
-        # Add divider
-        self.divider = nuke.Text_Knob('divider', '')
-        self.addKnob(self.divider)
-        
-        # Add start button
-        self.start_button = nuke.PyScript_Knob('start', 'Start Server')
-        self.start_button.setFlag(nuke.STARTLINE)
-        self.addKnob(self.start_button)
-        
-        # Add stop button
-        self.stop_button = nuke.PyScript_Knob('stop', 'Stop Server')
-        self.stop_button.setEnabled(False)
-        self.addKnob(self.stop_button)
-        
-        # Store the server instance
-        self.server = None
-    
-    def knobChanged(self, knob):
-        """Handle knob changes"""
-        if knob == self.start_button:
-            self._start_server()
-        elif knob == self.stop_button:
-            self._stop_server()
-    
-    def _start_server(self):
-        """Start the MCP server"""
-        if self.server is None:
-            port = int(self.port.value())
-            self.server = NukeMCPServer(port=port)
-            
-            if self.server.start():
-                self.status.setValue(f'Running on port {port}')
-                self.start_button.setEnabled(False)
-                self.stop_button.setEnabled(True)
-                self.port.setEnabled(False)
-            else:
-                self.status.setValue('Failed to start server')
-                self.server = None
-    
-    def _stop_server(self):
-        """Stop the MCP server"""
-        if self.server:
-            self.server.stop()
-            self.server = None
-            
-            self.status.setValue('Not connected')
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-            self.port.setEnabled(True)
-
-# Global instance of the panel
+# Global instance of the panel and of the server it (or menu.py) started
 _panel = None
+_global_server = None
+
+
+def _python_panel_base():
+    """Resolve PythonPanel after Nuke has finished starting up."""
+    import nukescripts as ns
+
+    base = getattr(ns, "PythonPanel", None)
+    if base is None:
+        # Some builds expose it under nukescripts.panels
+        try:
+            from nukescripts import panels as _panels
+
+            base = getattr(_panels, "PythonPanel", None)
+        except Exception:
+            base = None
+    if base is None:
+        raise AttributeError(
+            "nukescripts.PythonPanel is unavailable. Import nuke_mcp_addon from "
+            "menu.py (not init.py), after Nuke has finished starting."
+        )
+    return base
+
+
+def _make_panel_class():
+    PythonPanel = _python_panel_base()
+
+    class NukeMCPPanel(PythonPanel):
+        def __init__(self):
+            PythonPanel.__init__(self, 'Nuke MCP', 'com.example.NukeMCP')
+
+            self.port = nuke.Int_Knob('port', 'Port:')
+            self.port.setValue(DEFAULT_PORT)
+            self.addKnob(self.port)
+
+            self.status = nuke.Text_Knob('status', 'Status:')
+            self.status.setValue('Not connected')
+            self.addKnob(self.status)
+
+            self.divider = nuke.Text_Knob('divider', '')
+            self.addKnob(self.divider)
+
+            self.start_button = nuke.PyScript_Knob('start', 'Start Server')
+            self.start_button.setFlag(nuke.STARTLINE)
+            self.addKnob(self.start_button)
+
+            self.stop_button = nuke.PyScript_Knob('stop', 'Stop Server')
+            self.stop_button.setEnabled(False)
+            self.addKnob(self.stop_button)
+
+            self.server = None
+
+        def knobChanged(self, knob):
+            """Handle knob changes"""
+            if knob == self.start_button:
+                self._start_server()
+            elif knob == self.stop_button:
+                self._stop_server()
+
+        def _start_server(self):
+            """Start the MCP server"""
+            global _global_server
+            if self.server is None:
+                port = int(self.port.value())
+                self.server = NukeMCPServer(port=port)
+
+                if self.server.start():
+                    _global_server = self.server
+                    self.status.setValue(f'Running on port {port}')
+                    self.start_button.setEnabled(False)
+                    self.stop_button.setEnabled(True)
+                    self.port.setEnabled(False)
+                else:
+                    self.status.setValue('Failed to start server')
+                    self.server = None
+
+        def _stop_server(self):
+            """Stop the MCP server"""
+            global _global_server
+            if self.server:
+                self.server.stop()
+                if _global_server is self.server:
+                    _global_server = None
+                self.server = None
+
+                self.status.setValue('Not connected')
+                self.start_button.setEnabled(True)
+                self.stop_button.setEnabled(False)
+                self.port.setEnabled(True)
+
+    return NukeMCPPanel
+
 
 def show_panel():
-    """Show the NukeMCP panel"""
+    """Show the NukeMCP panel (creates the class on first use)."""
     global _panel
     if _panel is None:
-        _panel = NukeMCPPanel()
+        _panel = _make_panel_class()()
     _panel.show()
 
-# Add menu item
-nuke.menu('Nuke').addCommand('NukeMCP/Show Panel', show_panel)
+
+def ensure_server_running(port=None):
+    """Start the socket server without needing the panel UI.
+
+    menu.py calls this so an MCP client can connect to a freshly launched Nuke
+    without an operator opening the panel first.
+    """
+    global _global_server
+    if _global_server is not None and _global_server.running:
+        print(f"[NukeMCP] already running on port {_global_server.port}")
+        return _global_server
+
+    server = NukeMCPServer(port=port)
+    if not server.start():
+        raise RuntimeError(f"NukeMCP failed to bind port {server.port}")
+    _global_server = server
+    return server
